@@ -2,6 +2,15 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { RunLivenessState } from "@paperclipai/shared";
+import {
+  type IssueThrottleCeilingDecision,
+  type IssueThrottleExitSummary,
+  type LivenessContinuationBackoffConfig,
+  buildIssueThrottleCeilingIdempotencyKey,
+  buildIssueThrottleCeilingNotice,
+  computeLivenessContinuationBackoff,
+  decideIssueThrottleCeiling,
+} from "./liveness-continuation-throttle.js";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 import { RECOVERY_REASON_KINDS } from "./origins.js";
 
@@ -22,6 +31,11 @@ type IssueRow = Pick<
 >;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 
+export type RunContinuationBackoff = {
+  delayMs: number;
+  notBefore: string;
+};
+
 export type RunContinuationDecision =
   | {
       kind: "enqueue";
@@ -29,11 +43,29 @@ export type RunContinuationDecision =
       idempotencyKey: string;
       payload: Record<string, unknown>;
       contextSnapshot: Record<string, unknown>;
+      // Populated when a backoff config is supplied; the caller decides
+      // whether to honor it (enforce) or only log it (shadow).
+      backoff: RunContinuationBackoff | null;
+      // Per-issue rolling-window throttle-ceiling evaluation. In shadow mode a
+      // tripped ceiling still returns kind "enqueue" with throttle.tripped set
+      // so the caller can log the would-pause without changing behavior.
+      throttle: IssueThrottleCeilingDecision | null;
     }
   | {
       kind: "exhausted";
       attempt: number;
       maxAttempts: number;
+      comment: string;
+    }
+  | {
+      // Enforce mode only: K consecutive upstream-throttle exits for this
+      // issue inside the rolling window. The caller pauses the agent and files
+      // the consolidated notice exactly once per burst (idempotencyKey).
+      kind: "throttle_paused";
+      consecutive: number;
+      ceiling: number;
+      windowMs: number;
+      idempotencyKey: string;
       comment: string;
     }
   | {
@@ -92,6 +124,9 @@ export function decideRunLivenessContinuation(input: {
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
   maxAttempts?: number;
+  now?: Date;
+  backoffConfig?: LivenessContinuationBackoffConfig | null;
+  issueThrottleExits?: IssueThrottleExitSummary | null;
 }): RunContinuationDecision {
   const {
     run,
@@ -104,6 +139,8 @@ export function decideRunLivenessContinuation(input: {
     idempotentWakeExists,
   } = input;
   const maxAttempts = input.maxAttempts ?? DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS;
+  const now = input.now ?? new Date();
+  const backoffConfig = input.backoffConfig ?? null;
 
   if (!livenessState || !ACTIONABLE_LIVENESS_STATES.has(livenessState)) {
     return { kind: "skip", reason: "liveness state is not actionable for continuation" };
@@ -128,6 +165,38 @@ export function decideRunLivenessContinuation(input: {
   if (budgetBlocked) {
     return { kind: "skip", reason: "budget hard stop blocks continuation" };
   }
+
+  // Per-issue rolling-window ceiling: the per-source-run attempt cap below
+  // resets whenever a fresh wake starts a new source run, so a repeated
+  // upstream throttle can burst forever across source runs. K consecutive
+  // throttle exits inside the window is the real blocker (quota/rate-limit)
+  // and stops continuation for this issue entirely under enforce mode.
+  const throttle =
+    backoffConfig && input.issueThrottleExits
+      ? decideIssueThrottleCeiling(input.issueThrottleExits, backoffConfig)
+      : null;
+  if (throttle?.tripped && backoffConfig?.mode === "enforce") {
+    const idempotencyKey = buildIssueThrottleCeilingIdempotencyKey({
+      issueId: issue.id,
+      firstExitAt: input.issueThrottleExits?.firstExitAt ?? now,
+    });
+    return {
+      kind: "throttle_paused",
+      consecutive: throttle.consecutive,
+      ceiling: throttle.ceiling,
+      windowMs: throttle.windowMs,
+      idempotencyKey,
+      comment: buildIssueThrottleCeilingNotice({
+        issueIdentifier: issue.identifier ?? null,
+        consecutive: throttle.consecutive,
+        ceiling: throttle.ceiling,
+        windowMs: throttle.windowMs,
+        kinds: input.issueThrottleExits?.kinds ?? [],
+        idempotencyKey,
+      }),
+    };
+  }
+
   const currentAttempt = readContinuationAttempt(run.continuationAttempt);
   if (currentAttempt >= maxAttempts) {
     return {
@@ -168,10 +237,22 @@ export function decideRunLivenessContinuation(input: {
       "The previous run ended without concrete progress. Take the first concrete action now or mark the issue blocked with a specific unblock request.",
   }, "normal_model");
 
+  // The continuation itself backs off exponentially instead of firing
+  // immediately; the caller defers by delayMs under enforce mode and only
+  // logs the computed schedule under shadow mode.
+  const backoffSchedule =
+    backoffConfig && backoffConfig.mode !== "off"
+      ? computeLivenessContinuationBackoff(nextAttempt, backoffConfig, now)
+      : null;
+
   return {
     kind: "enqueue",
     nextAttempt,
     idempotencyKey,
+    backoff: backoffSchedule
+      ? { delayMs: backoffSchedule.delayMs, notBefore: backoffSchedule.notBefore.toISOString() }
+      : null,
+    throttle,
     payload,
     contextSnapshot: withRecoveryModelProfileHint({
       issueId: issue.id,

@@ -156,6 +156,9 @@ import {
   findExistingRunLivenessContinuationWake,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
+  resolveLivenessContinuationBackoffConfig,
+  summarizeIssueThrottleExits,
+  type IssueThrottleExitSummary,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
@@ -294,6 +297,7 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
+export const LIVENESS_CONTINUATION_BACKOFF_RETRY_REASON = "liveness_continuation_backoff";
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -6080,7 +6084,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
-  async function handleRunLivenessContinuation(run: typeof heartbeatRuns.$inferSelect) {
+  // Idempotent per burst: the key embeds the first exit of the current
+  // throttle streak, so re-evaluations of the same burst find the existing
+  // comment and do not escalate once per retry.
+  async function addIssueThrottleCeilingNoticeOnce(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string;
+    idempotencyKey: string;
+    comment: string;
+  }) {
+    const existing = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, input.run.companyId),
+          eq(issueComments.issueId, input.issueId),
+          sql`${issueComments.body} like ${`%${input.idempotencyKey}%`}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existing) return false;
+    await issuesSvc.addComment(input.issueId, input.comment, {
+      agentId: input.run.agentId,
+      runId: input.run.id,
+    });
+    return true;
+  }
+
+  async function summarizeIssueThrottleExitsForRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string;
+    windowMs: number;
+    now: Date;
+  }): Promise<IssueThrottleExitSummary> {
+    const recentRuns = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+        livenessState: heartbeatRuns.livenessState,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.run.companyId),
+          eq(heartbeatRuns.agentId, input.run.agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+          gte(heartbeatRuns.finishedAt, new Date(input.now.getTime() - input.windowMs)),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.finishedAt))
+      .limit(25);
+    return summarizeIssueThrottleExits(recentRuns, { now: input.now, windowMs: input.windowMs });
+  }
+
+  async function handleRunLivenessContinuation(
+    run: typeof heartbeatRuns.$inferSelect,
+    invokingAgent?: typeof agents.$inferSelect,
+  ) {
     const livenessState = run.livenessState as RunLivenessState | null;
     if (livenessState !== "plan_only" && livenessState !== "empty_response") return;
 
@@ -6161,6 +6226,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       : null;
 
+    const now = new Date();
+    const backoffConfig = resolveLivenessContinuationBackoffConfig(process.env);
+    const issueThrottleExits =
+      backoffConfig.mode !== "off" && issue
+        ? await summarizeIssueThrottleExitsForRun({
+          run,
+          issueId: issue.id,
+          windowMs: backoffConfig.throttleWindowMs,
+          now,
+        })
+        : null;
+
     const decision = decideRunLivenessContinuation({
       run,
       issue,
@@ -6170,7 +6247,56 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       nextAction: run.nextAction,
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
+      now,
+      backoffConfig: backoffConfig.mode === "off" ? null : backoffConfig,
+      issueThrottleExits,
     });
+
+    if (decision.kind === "throttle_paused") {
+      // Enforce mode: the per-issue rolling-window ceiling tripped. The real
+      // blocker is upstream quota/rate-limiting — pause the assignee and file
+      // one consolidated notice instead of an escalation per retry.
+      await db
+        .update(agents)
+        .set({
+          status: "paused",
+          pauseReason: "system",
+          pausedAt: now,
+          errorReason: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agents.id, run.agentId),
+            inArray(agents.status, ["active", "idle", "running", "error"]),
+          ),
+        );
+      await addIssueThrottleCeilingNoticeOnce({
+        run,
+        issueId,
+        idempotencyKey: decision.idempotencyKey,
+        comment: decision.comment,
+      });
+      await setRunStatus(run.id, run.status, {
+        livenessReason:
+          `${run.livenessReason ?? "Run ended without concrete progress"}; continuation suppressed by per-issue upstream throttle ceiling (${decision.consecutive}/${decision.ceiling})`,
+      });
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Liveness continuation suppressed: per-issue upstream throttle ceiling tripped; agent paused",
+        payload: {
+          issueId,
+          consecutive: decision.consecutive,
+          ceiling: decision.ceiling,
+          windowMs: decision.windowMs,
+          idempotencyKey: decision.idempotencyKey,
+          mode: backoffConfig.mode,
+        },
+      });
+      return;
+    }
 
     if (decision.kind === "exhausted") {
       await setRunStatus(run.id, run.status, {
@@ -6185,6 +6311,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (decision.kind !== "enqueue") return;
+
+    if (backoffConfig.mode === "shadow" && (decision.throttle?.tripped || decision.backoff)) {
+      // Shadow mode: log what enforce mode would do, then keep today's
+      // immediate-enqueue behavior byte-identical.
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: decision.throttle?.tripped ? "warn" : "info",
+        message: decision.throttle?.tripped
+          ? "shadow: per-issue upstream throttle ceiling tripped — enforce mode would pause the agent and suppress this continuation"
+          : `shadow: enforce mode would defer this liveness continuation by ${decision.backoff?.delayMs ?? 0}ms`,
+        payload: {
+          issueId,
+          mode: backoffConfig.mode,
+          continuationAttempt: decision.nextAttempt,
+          backoff: decision.backoff,
+          throttle: decision.throttle,
+        },
+      });
+    }
+
+    if (backoffConfig.mode === "enforce" && decision.backoff && decision.backoff.delayMs > 0 && invokingAgent) {
+      // Enforce mode: defer the continuation through the durable
+      // scheduled-retry path instead of waking immediately. The continuation
+      // context rides along via contextSnapshotPatch so the promoted run
+      // resumes at the incremented attempt.
+      const scheduled = await scheduleBoundedRetryForRun(run, invokingAgent, {
+        now,
+        retryReason: LIVENESS_CONTINUATION_BACKOFF_RETRY_REASON,
+        wakeReason: RUN_LIVENESS_CONTINUATION_REASON,
+        maxAttempts: (run.scheduledRetryAttempt ?? 0) + 1,
+        delayMs: decision.backoff.delayMs,
+        contextSnapshotPatch: decision.contextSnapshot,
+      });
+      if (scheduled.outcome === "scheduled") {
+        await db
+          .update(heartbeatRuns)
+          .set({
+            continuationAttempt: decision.nextAttempt,
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, run.id));
+        return;
+      }
+      // Fall through to the immediate enqueue if deferral could not be
+      // scheduled, so enforce mode never silently drops a continuation the
+      // decision layer approved.
+    }
 
     const continuationRun = await enqueueWakeup(run.agentId, {
       source: "automation",
@@ -7420,6 +7594,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      // Extra fields merged into the scheduled run's context snapshot before
+      // the system retry fields. Used by the deferred liveness continuation to
+      // carry the continuation attempt/instruction across the delay.
+      contextSnapshotPatch?: Record<string, unknown>;
     },
   ) {
     const now = opts?.now ?? new Date();
@@ -7535,6 +7713,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
       ...contextSnapshot,
+      ...(opts?.contextSnapshotPatch ?? {}),
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
@@ -11135,7 +11314,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
-        await handleRunLivenessContinuation(livenessRun);
+        await handleRunLivenessContinuation(livenessRun, agent);
         await handleSuccessfulRunHandoff(
           issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
             ? {

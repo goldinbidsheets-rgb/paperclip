@@ -40,8 +40,33 @@ export {
   readContinuationAttempt,
 } from "./run-liveness-continuations.js";
 export type {
+  RunContinuationBackoff,
   RunContinuationDecision,
 } from "./run-liveness-continuations.js";
+export {
+  DEFAULT_ISSUE_UPSTREAM_THROTTLE_CEILING,
+  DEFAULT_ISSUE_UPSTREAM_THROTTLE_WINDOW_MS,
+  DEFAULT_LIVENESS_CONTINUATION_BACKOFF_BASE_MS,
+  DEFAULT_LIVENESS_CONTINUATION_BACKOFF_CAP_MS,
+  LIVENESS_CONTINUATION_BACKOFF_MODES,
+  TRANSIENT_UPSTREAM_ERROR_FAMILY,
+  UPSTREAM_THROTTLED_LIVENESS_STATE,
+  buildIssueThrottleCeilingIdempotencyKey,
+  buildIssueThrottleCeilingNotice,
+  computeLivenessContinuationBackoff,
+  decideIssueThrottleCeiling,
+  readRunThrottleExitKind,
+  resolveLivenessContinuationBackoffConfig,
+  summarizeIssueThrottleExits,
+} from "./liveness-continuation-throttle.js";
+export type {
+  IssueThrottleCeilingDecision,
+  IssueThrottleExitSummary,
+  LivenessContinuationBackoffConfig,
+  LivenessContinuationBackoffMode,
+  ThrottleExitKind,
+  ThrottleExitRunLike,
+} from "./liveness-continuation-throttle.js";
 export {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
