@@ -16,7 +16,7 @@ import {
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
-import { classifyRunLiveness } from "./run-liveness.js";
+import { classifyRunLiveness, resolveUpstreamThrottledClassifierMode } from "./run-liveness.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -277,6 +277,7 @@ export function activityService(db: Db) {
         stderrExcerpt: run.stderrExcerpt,
         error: run.error,
         errorCode: run.errorCode,
+        upstreamThrottledMode: resolveUpstreamThrottledClassifierMode(),
         continuationAttempt,
         evidence: {
           issueCommentsCreated: countValue(commentStats?.count),

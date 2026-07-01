@@ -90,6 +90,8 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyRunLiveness,
+  resolveUpstreamThrottledClassifierMode,
+  upstreamThrottledRetryDelayMsFromRun,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
@@ -7410,6 +7412,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "promoted", run: promoted };
   }
 
+  // GOL-4038 Layer B: a run can exit "succeeded" with no output after a
+  // provider-side throttle (429/quota/5xx). The classifier marks it
+  // upstream_throttled; persist the transient_upstream contract on the run and
+  // route it through the bounded backoff scheduler, mirroring the failed-run
+  // transient path. The scheduled retry also counts as an active execution
+  // path, which keeps the successful-run handoff and the issue-graph liveness
+  // escalation from treating the throttle as a stall.
+  async function scheduleUpstreamThrottledBackoffForRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    const resultJson = parseObject(run.resultJson);
+    const retryDelayMs = upstreamThrottledRetryDelayMsFromRun({
+      runStatus: run.status,
+      issue: null,
+      resultJson,
+      stdoutExcerpt: run.stdoutExcerpt ?? null,
+      stderrExcerpt: run.stderrExcerpt ?? null,
+      error: run.error ?? null,
+    });
+    const retryNotBefore = retryDelayMs != null ? new Date(Date.now() + retryDelayMs).toISOString() : null;
+    const mergedResultJson = mergeAdapterRecoveryMetadata({
+      resultJson,
+      errorFamily: "transient_upstream",
+      retryNotBefore,
+    });
+    const persisted = await db
+      .update(heartbeatRuns)
+      .set({ resultJson: mergedResultJson, updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    return scheduleBoundedRetryForRun(persisted ?? { ...run, resultJson: mergedResultJson }, agent);
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -8927,6 +8964,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       stderrExcerpt: run.stderrExcerpt ?? null,
       error: run.error ?? null,
       errorCode: run.errorCode ?? null,
+      upstreamThrottledMode: resolveUpstreamThrottledClassifierMode(),
       continuationAttempt,
       evidence: {
         issueCommentsCreated: countValue(commentStats?.count),
@@ -11132,6 +11170,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
+        } else if (outcome === "succeeded" && livenessRun.livenessState === "upstream_throttled") {
+          await scheduleUpstreamThrottledBackoffForRun(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);

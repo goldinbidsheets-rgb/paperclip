@@ -92,6 +92,11 @@ const LIVENESS_COPY: Record<RunLivenessState, LivenessCopy> = {
     tone: "border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-300",
     description: "Run finished without useful output.",
   },
+  upstream_throttled: {
+    label: "Upstream throttled",
+    tone: "border-purple-500/30 bg-purple-500/10 text-purple-700 dark:text-purple-300",
+    description: "Provider rate limit hit; Paperclip scheduled a delayed retry.",
+  },
   blocked: {
     label: "Blocked",
     tone: "border-yellow-500/30 bg-yellow-500/10 text-yellow-700 dark:text-yellow-300",
@@ -340,6 +345,7 @@ function lastUsefulActionLabel(run: LedgerRun) {
     return "No concrete action";
   }
   if (run.livenessState === "empty_response") return "No useful output";
+  if (run.livenessState === "upstream_throttled") return "Provider throttled";
   if (!run.livenessState) return "Unavailable";
   return "None recorded";
 }

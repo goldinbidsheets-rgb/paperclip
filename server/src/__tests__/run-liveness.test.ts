@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { classifyRunLiveness } from "../services/run-liveness.ts";
+import {
+  classifyRunLiveness,
+  extractRetryableUpstreamRetryDelayMs,
+  isUpstreamThrottledBackoffPending,
+  resolveUpstreamThrottledClassifierMode,
+} from "../services/run-liveness.ts";
 
 const baseInput = {
   runStatus: "succeeded",
@@ -206,5 +211,139 @@ describe("run liveness classifier", () => {
     expect(classification.livenessState).toBe("needs_followup");
     expect(classification.actionability).toBe("unknown");
     expect(classification.nextAction).toBeNull();
+  });
+});
+
+describe("upstream throttled classification (GOL-4038 Layer B)", () => {
+  // Provider error payloads typically arrive as "status:"/"error:"-prefixed
+  // lines, which the useful-output heuristic strips as transcript noise —
+  // exactly why these runs historically landed in empty_response.
+  const throttledStderr = [
+    "status: 429",
+    'payload: {"code":429,"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded for quota metric"}',
+  ].join("\n");
+
+  it("keeps legacy empty_response behavior when the caller does not opt in", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      stderrExcerpt: throttledStderr,
+    });
+
+    expect(classification.livenessState).toBe("empty_response");
+    expect(classification.livenessReason).not.toContain("upstream");
+  });
+
+  it("classifies a succeeded 429/RESOURCE_EXHAUSTED run as upstream_throttled in enforce mode", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      stderrExcerpt: throttledStderr,
+      upstreamThrottledMode: "enforce",
+    });
+
+    expect(classification.livenessState).toBe("upstream_throttled");
+    expect(classification.livenessReason).toContain("retryable-upstream signature");
+  });
+
+  it("stays empty_response in shadow mode but records the would-be classification", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      stderrExcerpt: throttledStderr,
+      upstreamThrottledMode: "shadow",
+    });
+
+    expect(classification.livenessState).toBe("empty_response");
+    expect(classification.livenessReason).toContain("upstream-throttle shadow");
+    expect(classification.livenessReason).toContain("upstream_throttled");
+  });
+
+  it("matches AI_APICallError and overloaded signatures in enforce mode", () => {
+    for (const excerpt of [
+      "stderr: AI_APICallError: rate limited by provider",
+      'payload: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+      "status: 529",
+    ]) {
+      const classification = classifyRunLiveness({
+        ...baseInput,
+        stderrExcerpt: excerpt,
+        upstreamThrottledMode: "enforce",
+      });
+      expect(classification.livenessState).toBe("upstream_throttled");
+    }
+  });
+
+  it("does not throttle-classify when the run produced useful output", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: { summary: "Wrote the migration and updated the schema docs." },
+      stderrExcerpt: throttledStderr,
+      upstreamThrottledMode: "enforce",
+    });
+
+    expect(classification.livenessState).not.toBe("upstream_throttled");
+  });
+
+  it("does not match a bare numeric 429 outside an HTTP/status context", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      stderrExcerpt: "stdout: processed 429 rows from the batch export",
+      upstreamThrottledMode: "enforce",
+    });
+
+    expect(classification.livenessState).toBe("empty_response");
+  });
+
+  it("resolves the classifier mode from env with a shadow default", () => {
+    expect(resolveUpstreamThrottledClassifierMode({})).toBe("shadow");
+    expect(
+      resolveUpstreamThrottledClassifierMode({ PAPERCLIP_UPSTREAM_THROTTLED_CLASSIFIER_MODE: "enforce" }),
+    ).toBe("enforce");
+    expect(
+      resolveUpstreamThrottledClassifierMode({ PAPERCLIP_UPSTREAM_THROTTLED_CLASSIFIER_MODE: "OFF" }),
+    ).toBe("off");
+    expect(
+      resolveUpstreamThrottledClassifierMode({ PAPERCLIP_UPSTREAM_THROTTLED_CLASSIFIER_MODE: "bogus" }),
+    ).toBe("shadow");
+  });
+
+  it("extracts an explicit retry delay when the provider offers one", () => {
+    expect(extractRetryableUpstreamRetryDelayMs('"retryDelay": "27s"')).toBe(27_000);
+    expect(extractRetryableUpstreamRetryDelayMs("Retry-After: 60")).toBe(60_000);
+    expect(extractRetryableUpstreamRetryDelayMs("Please try again in 1.5s.")).toBe(1_500);
+    expect(extractRetryableUpstreamRetryDelayMs('"retryDelay": "86400s"')).toBe(15 * 60 * 1000);
+    expect(extractRetryableUpstreamRetryDelayMs("no delay hints here")).toBeNull();
+    expect(extractRetryableUpstreamRetryDelayMs(null)).toBeNull();
+  });
+
+  it("treats the backoff window as pending only while it is open", () => {
+    const now = new Date("2026-07-01T12:00:00Z");
+    expect(
+      isUpstreamThrottledBackoffPending({
+        livenessState: "upstream_throttled",
+        retryNotBefore: "2026-07-01T12:05:00Z",
+        now,
+      }),
+    ).toBe(true);
+    expect(
+      isUpstreamThrottledBackoffPending({
+        livenessState: "upstream_throttled",
+        retryNotBefore: "2026-07-01T11:55:00Z",
+        finishedAt: "2026-07-01T10:00:00Z",
+        now,
+      }),
+    ).toBe(false);
+    expect(
+      isUpstreamThrottledBackoffPending({
+        livenessState: "upstream_throttled",
+        finishedAt: "2026-07-01T11:45:00Z",
+        now,
+      }),
+    ).toBe(true);
+    expect(
+      isUpstreamThrottledBackoffPending({
+        livenessState: "empty_response",
+        retryNotBefore: "2026-07-01T12:05:00Z",
+        now,
+      }),
+    ).toBe(false);
   });
 });

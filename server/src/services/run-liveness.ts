@@ -24,6 +24,8 @@ export interface RunLivenessEvidenceInput {
   latestEvidenceAt: Date | null;
 }
 
+export type UpstreamThrottledClassifierMode = "off" | "shadow" | "enforce";
+
 export interface RunLivenessClassificationInput {
   runStatus: HeartbeatRunStatus | string;
   issue: RunLivenessIssueInput | null;
@@ -36,6 +38,7 @@ export interface RunLivenessClassificationInput {
   errorCode?: string | null;
   continuationAttempt?: number | null;
   evidence?: Partial<RunLivenessEvidenceInput> | null;
+  upstreamThrottledMode?: UpstreamThrottledClassifierMode | null;
 }
 
 export interface RunLivenessClassification {
@@ -75,6 +78,115 @@ const RUNNABLE_RE =
 const PLAN_TASK_TITLE_RE = /\b(?:plan|planning|analysis|investigation|research|report|proposal|design doc|write-?up)\b/i;
 const PLAN_TASK_DESCRIPTION_RE =
   /\b(?:create|write|produce|draft|update|revise|prepare)\s+(?:a\s+|the\s+)?(?:plan|analysis|investigation|research report|report|proposal|design doc|write-?up)\b/i;
+
+export const UPSTREAM_THROTTLED_CLASSIFIER_MODE_ENV = "PAPERCLIP_UPSTREAM_THROTTLED_CLASSIFIER_MODE";
+export const DEFAULT_UPSTREAM_THROTTLED_CLASSIFIER_MODE: UpstreamThrottledClassifierMode = "shadow";
+
+export function resolveUpstreamThrottledClassifierMode(
+  env: Record<string, string | undefined> = process.env,
+): UpstreamThrottledClassifierMode {
+  const raw = (env[UPSTREAM_THROTTLED_CLASSIFIER_MODE_ENV] ?? "").trim().toLowerCase();
+  if (raw === "off" || raw === "shadow" || raw === "enforce") return raw;
+  return DEFAULT_UPSTREAM_THROTTLED_CLASSIFIER_MODE;
+}
+
+// A child process can exit cleanly after a provider-side retryable error
+// (429/quota/5xx), leaving a "succeeded" run whose only content is the error
+// trace. These patterns are consulted ONLY on the empty_response fallthrough,
+// where the raw excerpts are error traces rather than task output. The 429/5xx
+// numerics require an HTTP/status context so prose mentioning a bare number
+// does not match.
+const RETRYABLE_UPSTREAM_SIGNATURE_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
+  { label: "RESOURCE_EXHAUSTED", re: /\bRESOURCE_EXHAUSTED\b/ },
+  { label: "AI_APICallError", re: /\bAI_APICallError\b/ },
+  { label: "http_429", re: /(?:\b(?:status(?:\s*code)?|code|error|http)\b[^\n\d]{0,12}429\b)|\b429\s+(?:too\s+many\s+requests|resource[\s_-]exhausted)/i },
+  { label: "too_many_requests", re: /\btoo many requests\b/i },
+  { label: "rate_limit", re: /\brate[\s_-]?limit(?:ed|s)?\b/i },
+  { label: "quota", re: /\b(?:quota[\s_-]?(?:exceeded|exhausted)|exceeded[^\n]{0,40}\bquota|insufficient[\s_-]quota)\b/i },
+  { label: "overloaded", re: /\boverloaded(?:_error)?\b/i },
+  { label: "http_5xx", re: /(?:\b(?:status(?:\s*code)?|code|error|http)\b[^\n\d]{0,12}5(?:00|02|03|04|29)\b)|\b50[234]\s+(?:bad\s+gateway|service\s+unavailable|gateway\s+timeout)\b/i },
+];
+
+function retryableUpstreamSignatureSources(input: RunLivenessClassificationInput) {
+  const resultJson = input.resultJson ?? null;
+  // Raw, unstripped excerpts: the provider error line often looks like the
+  // "noisy transcript" lines that rawSources() filters out.
+  return [
+    readText(input.stderrExcerpt),
+    readText(input.stdoutExcerpt),
+    readText(input.error),
+    readText(resultJson?.stderr),
+    readText(resultJson?.stdout),
+    readText(resultJson?.error),
+  ].filter((value): value is string => Boolean(value));
+}
+
+export function detectRetryableUpstreamSignature(input: RunLivenessClassificationInput): string | null {
+  const sources = retryableUpstreamSignatureSources(input);
+  if (sources.length === 0) return null;
+  const text = sources.join("\n");
+  for (const pattern of RETRYABLE_UPSTREAM_SIGNATURE_PATTERNS) {
+    if (pattern.re.test(text)) return pattern.label;
+  }
+  return null;
+}
+
+const MIN_UPSTREAM_RETRY_DELAY_MS = 1_000;
+const MAX_UPSTREAM_RETRY_DELAY_MS = 15 * 60 * 1000;
+
+const RETRYABLE_UPSTREAM_RETRY_DELAY_PATTERNS: ReadonlyArray<RegExp> = [
+  // Gemini RESOURCE_EXHAUSTED payload: "retryDelay": "27s"
+  /retry[-_ ]?delay["':\s]{0,4}"?(\d+(?:\.\d+)?)\s*s/i,
+  // Retry-After header echoed into the trace (seconds form)
+  /retry[-_ ]?after["':\s]{0,4}"?(\d+(?:\.\d+)?)(?:\s*s(?:econds?)?)?\b/i,
+  // OpenAI/Anthropic style: "Please try again in 20s" / "try again in 1.5s"
+  /try again in\s+(\d+(?:\.\d+)?)\s*s/i,
+];
+
+export function extractRetryableUpstreamRetryDelayMs(text: string | null | undefined): number | null {
+  if (!text) return null;
+  for (const pattern of RETRYABLE_UPSTREAM_RETRY_DELAY_PATTERNS) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    const seconds = Number.parseFloat(match[1] ?? "");
+    if (!Number.isFinite(seconds) || seconds <= 0) continue;
+    return Math.min(MAX_UPSTREAM_RETRY_DELAY_MS, Math.max(MIN_UPSTREAM_RETRY_DELAY_MS, Math.round(seconds * 1000)));
+  }
+  return null;
+}
+
+export function upstreamThrottledRetryDelayMsFromRun(input: RunLivenessClassificationInput): number | null {
+  const sources = retryableUpstreamSignatureSources(input);
+  return sources.length > 0 ? extractRetryableUpstreamRetryDelayMs(sources.join("\n")) : null;
+}
+
+export const UPSTREAM_THROTTLED_ESCALATION_GRACE_MS = 30 * 60 * 1000;
+
+// Alarm exemption (GOL-4038 Layer B): while an upstream_throttled run's
+// backoff window is still pending, a missing execution path is expected, not
+// an incident. Once the window (retryNotBefore, else a bounded grace after the
+// run finished) lapses without a scheduled retry, escalation proceeds normally
+// so real stalls still surface.
+export function isUpstreamThrottledBackoffPending(input: {
+  livenessState: string | null | undefined;
+  retryNotBefore?: string | number | Date | null;
+  finishedAt?: string | number | Date | null;
+  now?: Date;
+  graceMs?: number;
+}): boolean {
+  if (input.livenessState !== "upstream_throttled") return false;
+  const now = input.now ?? new Date();
+  const graceMs = input.graceMs ?? UPSTREAM_THROTTLED_ESCALATION_GRACE_MS;
+  if (input.retryNotBefore != null) {
+    const retryNotBefore = new Date(input.retryNotBefore);
+    if (!Number.isNaN(retryNotBefore.getTime()) && retryNotBefore.getTime() > now.getTime()) return true;
+  }
+  if (input.finishedAt != null) {
+    const finishedAt = new Date(input.finishedAt);
+    if (!Number.isNaN(finishedAt.getTime()) && now.getTime() - finishedAt.getTime() < graceMs) return true;
+  }
+  return false;
+}
 
 function compactReason(reason: string) {
   return reason.length <= 500 ? reason : `${reason.slice(0, 497)}...`;
@@ -309,6 +421,29 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
     actionability,
   });
 
+  // GOL-4038 Layer B: a succeeded run that would otherwise be empty_response
+  // but whose raw output carries a retryable-upstream signature (429 /
+  // RESOURCE_EXHAUSTED / quota / 5xx) is a provider throttle, not an empty
+  // agent turn. Enforce mode classifies it upstream_throttled so the bounded
+  // backoff scheduler owns the retry instead of the immediate liveness
+  // continuation. Callers that do not opt in ("off") keep legacy behavior.
+  const emptyOrUpstreamThrottled = (baseReason: string): RunLivenessClassification => {
+    const mode = input.upstreamThrottledMode ?? "off";
+    if (mode === "off") return output("empty_response", baseReason);
+    const signature = detectRetryableUpstreamSignature(input);
+    if (!signature) return output("empty_response", baseReason);
+    if (mode === "shadow") {
+      return output(
+        "empty_response",
+        `${baseReason} [upstream-throttle shadow: retryable-upstream signature (${signature}) detected; enforce mode would classify upstream_throttled]`,
+      );
+    }
+    return output(
+      "upstream_throttled",
+      `Run succeeded without useful output but its raw output carries a retryable-upstream signature (${signature}); deferring to bounded backoff instead of immediate continuation`,
+    );
+  };
+
   if (input.runStatus !== "succeeded") {
     return output("failed", input.errorCode ? `Run ended with ${input.runStatus} (${input.errorCode})` : `Run ended with ${input.runStatus}`);
   }
@@ -322,7 +457,7 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
   }
 
   if (!usefulOutput && !concreteEvidence) {
-    return output("empty_response", "Run succeeded without useful output or concrete action evidence");
+    return emptyOrUpstreamThrottled("Run succeeded without useful output or concrete action evidence");
   }
 
   if (concreteEvidence) {
@@ -344,5 +479,5 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
     return output("needs_followup", "Run produced useful output but no concrete action evidence", nextAction);
   }
 
-  return output("empty_response", "Run succeeded without useful output");
+  return emptyOrUpstreamThrottled("Run succeeded without useful output");
 }

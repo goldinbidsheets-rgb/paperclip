@@ -171,3 +171,22 @@ describe("run liveness continuations", () => {
     }
   });
 });
+
+describe("upstream throttled continuation exclusion (GOL-4038 Layer B)", () => {
+  it("skips immediate continuation for upstream_throttled runs", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run(),
+      issue: issue(),
+      agent: agent(),
+      livenessState: "upstream_throttled",
+      livenessReason: "Run succeeded without useful output but its raw output carries a retryable-upstream signature (RESOURCE_EXHAUSTED)",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+    });
+
+    expect(decision.kind).toBe("skip");
+    if (decision.kind !== "skip") return;
+    expect(decision.reason).toContain("not actionable");
+  });
+});

@@ -754,6 +754,7 @@ export const RUN_LIVENESS_STATES = [
   "advanced",
   "plan_only",
   "empty_response",
+  "upstream_throttled",
   "blocked",
   "failed",
   "needs_followup",

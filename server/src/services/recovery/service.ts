@@ -62,6 +62,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { isUpstreamThrottledBackoffPending } from "../run-liveness.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -3682,6 +3683,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  // GOL-4038 Layer B: an upstream_throttled run whose backoff window is still
+  // pending is waiting on a provider throttle, not stalled. Exempt it from the
+  // harness_liveness_escalation alarm while the window is open; once the
+  // window lapses without a live retry, escalation proceeds normally.
+  async function isLivenessFindingExemptForUpstreamThrottle(finding: IssueLivenessFinding) {
+    const candidateIssueIds = [...new Set([finding.issueId, livenessRecoveryLeafIssueId(finding)])];
+    const now = new Date();
+    for (const issueId of candidateIssueIds) {
+      const latestRun = await db
+        .select({
+          livenessState: heartbeatRuns.livenessState,
+          resultJson: heartbeatRuns.resultJson,
+          finishedAt: heartbeatRuns.finishedAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, finding.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!latestRun) continue;
+      const resultJson = parseObject(latestRun.resultJson);
+      if (
+        isUpstreamThrottledBackoffPending({
+          livenessState: latestRun.livenessState,
+          retryNotBefore:
+            readNonEmptyString(resultJson.retryNotBefore) ?? readNonEmptyString(resultJson.transientRetryNotBefore),
+          finishedAt: latestRun.finishedAt,
+          now,
+        })
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function createIssueGraphLivenessEscalation(input: {
     finding: IssueLivenessFinding;
     runId?: string | null;
@@ -3693,6 +3735,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
     if (!issue || issue.companyId !== input.finding.companyId) return { kind: "skipped" as const };
     if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+      return { kind: "skipped" as const };
+    }
+    if (await isLivenessFindingExemptForUpstreamThrottle(input.finding)) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.runId ?? null,
+        action: "issue.harness_liveness_escalation_exempted",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          source: "recovery.reconcile_issue_graph_liveness",
+          incidentKey: input.finding.incidentKey,
+          findingState: input.finding.state,
+          reason: "upstream_throttled backoff window is still pending",
+        },
+      });
       return { kind: "skipped" as const };
     }
 
