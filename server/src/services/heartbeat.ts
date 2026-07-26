@@ -11500,6 +11500,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               })
               .where(eq(agentWakeupRequests.id, wakeupRequestId));
           }
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: existingRetry.id,
+              executionAgentNameKey: normalizeAgentNameKey(agent.name),
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(and(
+              eq(issues.id, providerQuotaRetryBoundary.issueId),
+              eq(issues.companyId, run.companyId),
+              eq(issues.executionRunId, run.id),
+            ));
           return {
             outcome: "scheduled",
             run: existingRetry,

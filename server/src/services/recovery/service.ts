@@ -3038,6 +3038,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     agentId: string;
   }) {
     const now = new Date();
+    const retryAgent = await getAgent(input.agentId);
+    const retryAgentNameKey = retryAgent?.name.trim().toLowerCase() || null;
     const retryBoundary = readProviderQuotaRetryBoundary({
       latestRun: input.latestRun,
       now,
@@ -3135,6 +3137,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             updatedAt: now,
           })
           .where(eq(issueRecoveryActions.id, input.actionId));
+        if (input.latestRun) {
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: existing.id,
+              executionAgentNameKey: retryAgentNameKey,
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(and(
+              eq(issues.id, input.issue.id),
+              eq(issues.companyId, input.issue.companyId),
+              eq(issues.executionRunId, input.latestRun.id),
+            ));
+        }
         return existing;
       }
 
@@ -3201,6 +3218,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           updatedAt: now,
         })
         .where(eq(issueRecoveryActions.id, input.actionId));
+      if (input.latestRun) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: scheduledRun.id,
+            executionAgentNameKey: retryAgentNameKey,
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issues.id, input.issue.id),
+            eq(issues.companyId, input.issue.companyId),
+            eq(issues.executionRunId, input.latestRun.id),
+          ));
+      }
       return scheduledRun;
     });
   }
@@ -3445,11 +3477,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
-    });
+    const updated = await issuesSvc.update(input.issue.id, isProviderQuotaWait
+      ? {
+          status: input.issue.status,
+          assigneeAgentId: input.issue.assigneeAgentId,
+        }
+      : {
+          status: "blocked",
+          blockedByIssueIds: blockerIds,
+          assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+        });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
 
