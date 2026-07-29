@@ -983,6 +983,9 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
+        const promotion = await heartbeat.promoteDueScheduledRetries();
+        await heartbeat.resumeQueuedRuns();
+
         try {
           const queuedLockReap = await heartbeat.reapStaleQueuedExecutionLocks();
           logger.info(
@@ -1000,8 +1003,6 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
-        const promotion = await heartbeat.promoteDueScheduledRetries();
-        await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||
@@ -1162,10 +1163,10 @@ export async function startServer(): Promise<StartedServer> {
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-            .then(() => heartbeat.reapStaleQueuedExecutionLocks())
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
+              await heartbeat.reapStaleQueuedExecutionLocks();
               const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
               if (
                 promotion.promoted > 0 ||

@@ -361,6 +361,12 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
     expect(heartbeatServiceMock.reapStaleQueuedExecutionLocks).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.promoteDueScheduledRetries.mock.invocationCallOrder[0]).toBeLessThan(
+      heartbeatServiceMock.resumeQueuedRuns.mock.invocationCallOrder[0]!,
+    );
+    expect(heartbeatServiceMock.resumeQueuedRuns.mock.invocationCallOrder[0]).toBeLessThan(
+      heartbeatServiceMock.reapStaleQueuedExecutionLocks.mock.invocationCallOrder[0]!,
+    );
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {

@@ -16,6 +16,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE } from "../services/stale-queued-execution-lock.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -271,6 +272,28 @@ describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
     expect(run?.status).toBe("queued");
   });
 
+  it("reaps a legacy locked row that predates an enabled worktree cutoff", async () => {
+    const cutoff = new Date("2026-07-29T11:00:00.000Z");
+    const runtimeEnv = {
+      PAPERCLIP_IN_WORKTREE: "true",
+      PAPERCLIP_INSTANCE_ID: "stale-queued-lock-test",
+    };
+    await instanceSettingsService(db, {
+      runtimeEnv,
+      now: () => cutoff,
+    }).updateExperimental({ enableWorktreeRunExecution: true });
+    const worktreeHeartbeat = heartbeatService(db, { runtimeEnv });
+    const seeded = await seedLockedQueuedRun();
+
+    const result = await worktreeHeartbeat.reapStaleQueuedExecutionLocks({ now });
+
+    expect(result).toEqual({
+      reaped: 1,
+      runIds: [seeded.runId],
+      issueIds: [seeded.issueId],
+    });
+  });
+
   it("preserves an overdue retry while its agent is at capacity, then allows it to claim", async () => {
     const seeded = await seedLockedQueuedRun();
     const capacityRunId = randomUUID();
@@ -295,8 +318,10 @@ describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
       .where(eq(heartbeatRuns.id, capacityRunId));
 
     await heartbeat.resumeQueuedRuns();
+    const afterResume = await heartbeat.reapStaleQueuedExecutionLocks({ now });
     await heartbeat.drainActiveRunExecutions();
 
+    expect(afterResume).toEqual({ reaped: 0, runIds: [], issueIds: [] });
     const [run, wakeup] = await Promise.all([
       db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)).then((rows) => rows[0]),
       db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeupRequestId)).then((rows) => rows[0]),

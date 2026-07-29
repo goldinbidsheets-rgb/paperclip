@@ -11889,7 +11889,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     companyId?: string;
   }) {
     const now = opts?.now ?? new Date();
-    const cutoff = await getWorktreeExecutionCutoff();
     const candidates = await db
       .select({
         issue: issues,
@@ -11914,7 +11913,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(
         eq(heartbeatRuns.status, "queued"),
         opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
-        cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
       ));
 
     const candidateAgentIds = [...new Set(candidates.map((candidate) => candidate.run.agentId))];
