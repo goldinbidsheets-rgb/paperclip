@@ -10725,21 +10725,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status !== "queued") return run;
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
-    if (issueId) {
-      const staleExecutionLock = await tryReapStaleQueuedExecutionLock({
-        companyId: run.companyId,
-        issueId,
-        runId: run.id,
-        now: new Date(),
-      });
-      if (staleExecutionLock) {
-        logger.info(
-          { runId: run.id, issueId },
-          "claimQueuedRun: reaped stale queued execution lock before claim",
-        );
-        return null;
-      }
-    }
 
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -11486,13 +11471,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
 
     if (!snapshot) return null;
-    const preliminary = classifyStaleQueuedExecutionLock({
-      ...snapshot,
-      now: input.now,
-    });
-    if (!preliminary.stale) return null;
-
-    const reaped = await db.transaction(async (tx) => {
+    const reaped = await withAgentStartLock(snapshot.run.agentId, async () => db.transaction(async (tx) => {
       // Match claimQueuedRun's mutation order (run -> wakeup -> issue) so a
       // concurrent claim either wins cleanly or observes this cancellation.
       const lockedRun = await tx
@@ -11528,10 +11507,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null);
       if (!lockedIssue) return null;
 
+      const runningRun = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.agentId, lockedRun.agentId),
+          eq(heartbeatRuns.status, "running"),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
       const classification = classifyStaleQueuedExecutionLock({
         issue: lockedIssue,
         run: lockedRun,
         wakeup: lockedWakeup,
+        agentHasRunningRun: Boolean(runningRun),
         now: input.now,
       });
       if (!classification.stale) return null;
@@ -11645,7 +11634,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         wakeupRequestId: lockedWakeup.id,
         classification,
       };
-    });
+    }));
 
     if (reaped) {
       clearHeartbeatRunRuntimeStatus(reaped.run.id);
@@ -11692,6 +11681,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
       ));
 
+    const candidateAgentIds = [...new Set(candidates.map((candidate) => candidate.run.agentId))];
+    const runningAgentRows = candidateAgentIds.length > 0
+      ? await db
+          .select({ agentId: heartbeatRuns.agentId })
+          .from(heartbeatRuns)
+          .where(and(
+            inArray(heartbeatRuns.agentId, candidateAgentIds),
+            eq(heartbeatRuns.status, "running"),
+          ))
+      : [];
+    const agentsWithRunningRuns = new Set(runningAgentRows.map((row) => row.agentId));
     const reapedRunIds: string[] = [];
     const reapedIssueIds: string[] = [];
     const visitedRunIds = new Set<string>();
@@ -11700,6 +11700,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       visitedRunIds.add(candidate.run.id);
       const preliminary = classifyStaleQueuedExecutionLock({
         ...candidate,
+        agentHasRunningRun: agentsWithRunningRuns.has(candidate.run.agentId),
         now,
       });
       if (!preliminary.stale) continue;

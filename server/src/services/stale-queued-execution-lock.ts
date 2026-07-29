@@ -4,7 +4,9 @@ import type {
   issues,
 } from "@paperclipai/db";
 
-export const STALE_QUEUED_EXECUTION_LOCK_GRACE_MS = 5 * 60 * 1000;
+// Queued retries can legitimately wait behind long agent runs. Require a
+// materially overdue hour in addition to the no-active-run classifier gate.
+export const STALE_QUEUED_EXECUTION_LOCK_GRACE_MS = 60 * 60 * 1000;
 export const STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE = "stale_queued_execution_lock";
 
 type IssueExecutionLock = Pick<
@@ -82,13 +84,15 @@ export function classifyStaleQueuedExecutionLock(input: {
   issue: IssueExecutionLock;
   run: QueuedRun;
   wakeup: QueuedWakeup | null;
+  agentHasRunningRun: boolean;
   now: Date;
 }): StaleQueuedExecutionLockClassification {
-  const { issue, run, wakeup, now } = input;
+  const { issue, run, wakeup, agentHasRunningRun, now } = input;
 
   if (issue.executionRunId !== run.id || run.status !== "queued") {
     return { stale: false };
   }
+  if (agentHasRunningRun) return { stale: false };
   if (hasExecutionEvidence(run)) return { stale: false };
   if (
     !run.wakeupRequestId

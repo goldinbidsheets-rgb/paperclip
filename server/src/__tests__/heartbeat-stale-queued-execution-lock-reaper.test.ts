@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -17,6 +17,29 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE } from "../services/stale-queued-execution-lock.js";
+
+const mockAdapterExecute = vi.hoisted(() =>
+  vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    errorMessage: null,
+    summary: "Capacity-blocked queued run claimed.",
+    provider: "test",
+    model: "test-model",
+  })),
+);
+
+vi.mock("../adapters/index.ts", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({
+      supportsLocalAgentJwt: false,
+      execute: mockAdapterExecute,
+    })),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -49,6 +72,8 @@ describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await heartbeat.drainActiveRunExecutions();
+    mockAdapterExecute.mockClear();
     await db.execute(sql.raw('TRUNCATE TABLE "companies" RESTART IDENTITY CASCADE'));
   });
 
@@ -208,6 +233,22 @@ describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
     expect(issue?.executionRunId).toBe(seeded.runId);
   });
 
+  it("does not reap a scheduled retry within the one-hour overdue grace", async () => {
+    const seeded = await seedLockedQueuedRun({
+      scheduledRetryAt: new Date("2026-07-29T11:15:00.000Z"),
+    });
+
+    const result = await heartbeat.reapStaleQueuedExecutionLocks({ now });
+
+    expect(result).toEqual({ reaped: 0, runIds: [], issueIds: [] });
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.runId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("queued");
+  });
+
   it("does not reap recently queued ordinary work", async () => {
     const seeded = await seedLockedQueuedRun({
       createdAt: new Date("2026-07-29T11:58:00.000Z"),
@@ -228,6 +269,43 @@ describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
       .where(eq(heartbeatRuns.id, seeded.runId))
       .then((rows) => rows[0]);
     expect(run?.status).toBe("queued");
+  });
+
+  it("preserves an overdue retry while its agent is at capacity, then allows it to claim", async () => {
+    const seeded = await seedLockedQueuedRun();
+    const capacityRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: capacityRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "timer",
+      triggerDetail: "interval",
+      status: "running",
+      startedAt: new Date("2026-07-29T10:00:00.000Z"),
+      createdAt: new Date("2026-07-29T10:00:00.000Z"),
+      updatedAt: new Date("2026-07-29T10:00:00.000Z"),
+    });
+
+    const whileAtCapacity = await heartbeat.reapStaleQueuedExecutionLocks({ now });
+
+    expect(whileAtCapacity).toEqual({ reaped: 0, runIds: [], issueIds: [] });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: now, updatedAt: now })
+      .where(eq(heartbeatRuns.id, capacityRunId));
+
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    const [run, wakeup] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)).then((rows) => rows[0]),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeupRequestId)).then((rows) => rows[0]),
+    ]);
+    expect(mockAdapterExecute).toHaveBeenCalled();
+    expect(run?.startedAt).not.toBeNull();
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).not.toBe(STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE);
+    expect(wakeup?.status).toBe("completed");
   });
 
   it("is a no-op when a claim wins after stale-candidate discovery", async () => {
@@ -281,8 +359,7 @@ describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
       agentId: seeded.agentId,
       invocationSource: "assignment",
       triggerDetail: "system",
-      status: "running",
-      startedAt: now,
+      status: "queued",
       contextSnapshot: { issueId: seeded.issueId },
       createdAt: now,
       updatedAt: now,
