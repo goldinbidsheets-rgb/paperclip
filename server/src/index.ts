@@ -983,6 +983,23 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
+        try {
+          const queuedLockReap = await heartbeat.reapStaleQueuedExecutionLocks();
+          logger.info(
+            {
+              reaped: queuedLockReap.reaped,
+              runIds: queuedLockReap.runIds,
+              issueIds: queuedLockReap.issueIds,
+            },
+            "startup reap of stale queued execution locks complete",
+          );
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup reap of stale queued execution locks failed - periodic reaper will serve as degraded backstop",
+          );
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
@@ -1145,6 +1162,7 @@ export async function startServer(): Promise<StartedServer> {
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+            .then(() => heartbeat.reapStaleQueuedExecutionLocks())
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();

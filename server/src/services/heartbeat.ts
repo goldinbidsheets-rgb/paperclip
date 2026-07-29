@@ -212,6 +212,10 @@ import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
+import {
+  classifyStaleQueuedExecutionLock,
+  STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE,
+} from "./stale-queued-execution-lock.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
@@ -10719,6 +10723,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (issueId) {
+      const staleExecutionLock = await tryReapStaleQueuedExecutionLock({
+        companyId: run.companyId,
+        issueId,
+        runId: run.id,
+        now: new Date(),
+      });
+      if (staleExecutionLock) {
+        logger.info(
+          { runId: run.id, issueId },
+          "claimQueuedRun: reaped stale queued execution lock before claim",
+        );
+        return null;
+      }
+    }
+
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
@@ -10732,7 +10754,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
-    const context = parseObject(run.contextSnapshot);
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
       issueId: readNonEmptyString(context.issueId),
       projectId: readNonEmptyString(context.projectId),
@@ -10752,7 +10773,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
-    const issueId = readNonEmptyString(context.issueId);
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(run.companyId, issueId);
       const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(db, {
@@ -11426,6 +11446,286 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(heartbeatRuns.id, run.id))
       .returning()
       .then((rows) => rows[0] ?? null);
+  }
+
+  const staleQueuedExecutionLockReason =
+    "Cancelled stale queued execution lock after its eligibility grace elapsed without a claim or execution evidence";
+
+  async function tryReapStaleQueuedExecutionLock(input: {
+    companyId: string;
+    issueId: string;
+    runId: string;
+    now: Date;
+  }) {
+    const snapshot = await db
+      .select({
+        issue: issues,
+        run: heartbeatRuns,
+        wakeup: agentWakeupRequests,
+      })
+      .from(issues)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.companyId, issues.companyId),
+          eq(issues.executionRunId, heartbeatRuns.id),
+        ),
+      )
+      .innerJoin(
+        agentWakeupRequests,
+        and(
+          eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
+        ),
+      )
+      .where(and(
+        eq(issues.id, input.issueId),
+        eq(issues.companyId, input.companyId),
+      ))
+      .then((rows) => rows[0] ?? null);
+
+    if (!snapshot) return null;
+    const preliminary = classifyStaleQueuedExecutionLock({
+      ...snapshot,
+      now: input.now,
+    });
+    if (!preliminary.stale) return null;
+
+    const reaped = await db.transaction(async (tx) => {
+      // Match claimQueuedRun's mutation order (run -> wakeup -> issue) so a
+      // concurrent claim either wins cleanly or observes this cancellation.
+      const lockedRun = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.companyId, input.companyId),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!lockedRun?.wakeupRequestId) return null;
+
+      const lockedWakeup = await tx
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.id, lockedRun.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, input.companyId),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!lockedWakeup) return null;
+
+      const lockedIssue = await tx
+        .select()
+        .from(issues)
+        .where(and(
+          eq(issues.id, input.issueId),
+          eq(issues.companyId, input.companyId),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!lockedIssue) return null;
+
+      const classification = classifyStaleQueuedExecutionLock({
+        issue: lockedIssue,
+        run: lockedRun,
+        wakeup: lockedWakeup,
+        now: input.now,
+      });
+      if (!classification.stale) return null;
+
+      const cancelledRun = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt: input.now,
+          error: staleQueuedExecutionLockReason,
+          errorCode: STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE,
+          resultJson: {
+            ...parseObject(lockedRun.resultJson),
+            stopReason: STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE,
+            effectiveTimeoutSec: Math.floor(classification.graceMs / 1000),
+            timeoutConfigured: true,
+            timeoutSource: "stale_queued_execution_lock_reaper",
+            timeoutFired: true,
+          },
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, lockedRun.id),
+          eq(heartbeatRuns.status, "queued"),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!cancelledRun) return null;
+
+      const cancelledWakeup = await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: input.now,
+          error: staleQueuedExecutionLockReason,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(agentWakeupRequests.id, lockedWakeup.id),
+          eq(agentWakeupRequests.runId, lockedRun.id),
+          eq(agentWakeupRequests.status, "queued"),
+          isNull(agentWakeupRequests.claimedAt),
+          isNull(agentWakeupRequests.finishedAt),
+        ))
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0] ?? null);
+      if (!cancelledWakeup) {
+        throw new Error(`Stale queued execution-lock wakeup changed while locked (${lockedWakeup.id})`);
+      }
+
+      const clearedIssue = await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(issues.id, lockedIssue.id),
+          eq(issues.companyId, lockedIssue.companyId),
+          eq(issues.executionRunId, lockedRun.id),
+        ))
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+      if (!clearedIssue) {
+        throw new Error(`Stale queued execution lock changed while locked (${lockedIssue.id})`);
+      }
+
+      const eventSeq = await tx
+        .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, lockedRun.id))
+        .then((rows) => Number(rows[0]?.maxSeq ?? 0) + 1);
+      const auditDetails = {
+        source: "heartbeat.stale_queued_execution_lock_reaper",
+        issueId: lockedIssue.id,
+        runId: lockedRun.id,
+        wakeupRequestId: lockedWakeup.id,
+        eligibilityAt: classification.eligibilityAt.toISOString(),
+        staleAt: classification.staleAt.toISOString(),
+        graceMs: classification.graceMs,
+      };
+
+      await tx.insert(heartbeatRunEvents).values({
+        companyId: cancelledRun.companyId,
+        runId: cancelledRun.id,
+        agentId: cancelledRun.agentId,
+        seq: eventSeq,
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: staleQueuedExecutionLockReason,
+        payload: auditDetails,
+      });
+      await logActivity(tx as unknown as Db, {
+        companyId: cancelledRun.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: cancelledRun.agentId,
+        runId: cancelledRun.id,
+        action: "issue.stale_queued_execution_lock_reaped",
+        entityType: "issue",
+        entityId: lockedIssue.id,
+        details: auditDetails,
+      });
+
+      return {
+        run: cancelledRun,
+        issueId: lockedIssue.id,
+        wakeupRequestId: lockedWakeup.id,
+        classification,
+      };
+    });
+
+    if (reaped) {
+      clearHeartbeatRunRuntimeStatus(reaped.run.id);
+      publishLiveEvent({
+        companyId: reaped.run.companyId,
+        type: "heartbeat.run.status",
+        payload: buildHeartbeatRunStatusLiveEventPayload(reaped.run),
+      });
+      publishRunLifecyclePluginEvent(reaped.run);
+    }
+    return reaped;
+  }
+
+  async function reapStaleQueuedExecutionLocks(opts?: {
+    now?: Date;
+    companyId?: string;
+  }) {
+    const now = opts?.now ?? new Date();
+    const cutoff = await getWorktreeExecutionCutoff();
+    const candidates = await db
+      .select({
+        issue: issues,
+        run: heartbeatRuns,
+        wakeup: agentWakeupRequests,
+      })
+      .from(issues)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(issues.executionRunId, heartbeatRuns.id),
+          eq(issues.companyId, heartbeatRuns.companyId),
+        ),
+      )
+      .innerJoin(
+        agentWakeupRequests,
+        and(
+          eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
+        ),
+      )
+      .where(and(
+        eq(heartbeatRuns.status, "queued"),
+        opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+        cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+      ));
+
+    const reapedRunIds: string[] = [];
+    const reapedIssueIds: string[] = [];
+    const visitedRunIds = new Set<string>();
+    for (const candidate of candidates) {
+      if (visitedRunIds.has(candidate.run.id)) continue;
+      visitedRunIds.add(candidate.run.id);
+      const preliminary = classifyStaleQueuedExecutionLock({
+        ...candidate,
+        now,
+      });
+      if (!preliminary.stale) continue;
+
+      const reaped = await tryReapStaleQueuedExecutionLock({
+        companyId: candidate.issue.companyId,
+        issueId: candidate.issue.id,
+        runId: candidate.run.id,
+        now,
+      });
+      if (!reaped) continue;
+      reapedRunIds.push(reaped.run.id);
+      reapedIssueIds.push(reaped.issueId);
+    }
+
+    if (reapedRunIds.length > 0) {
+      logger.warn(
+        { reaped: reapedRunIds.length, runIds: reapedRunIds, issueIds: reapedIssueIds },
+        "reaped stale queued execution locks",
+      );
+    }
+    return {
+      reaped: reapedRunIds.length,
+      runIds: reapedRunIds,
+      issueIds: reapedIssueIds,
+    };
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
@@ -17036,6 +17336,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    reapStaleQueuedExecutionLocks,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.

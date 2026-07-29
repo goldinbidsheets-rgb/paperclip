@@ -1,0 +1,322 @@
+import { randomUUID } from "node:crypto";
+import { eq, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  activityLog,
+  agents,
+  agentWakeupRequests,
+  companies,
+  createDb,
+  heartbeatRunEvents,
+  heartbeatRuns,
+  issues,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE } from "../services/stale-queued-execution-lock.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres stale queued execution-lock reaper tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
+  let db!: ReturnType<typeof createDb>;
+  let heartbeat!: ReturnType<typeof heartbeatService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  const now = new Date("2026-07-29T12:00:00.000Z");
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stale-queued-lock-");
+    db = createDb(tempDb.connectionString);
+    heartbeat = heartbeatService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.execute(sql.raw('TRUNCATE TABLE "companies" RESTART IDENTITY CASCADE'));
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedLockedQueuedRun(input?: {
+    createdAt?: Date;
+    scheduledRetryAt?: Date | null;
+    runPatch?: Partial<typeof heartbeatRuns.$inferInsert>;
+    wakeupPatch?: Partial<typeof agentWakeupRequests.$inferInsert>;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const runId = randomUUID();
+    const createdAt = input?.createdAt ?? new Date("2026-07-28T05:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "QueueReaperAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "scheduled_retry",
+      payload: { issueId },
+      status: "queued",
+      runId,
+      requestedAt: createdAt,
+      createdAt,
+      updatedAt: createdAt,
+      ...(input?.wakeupPatch ?? {}),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      scheduledRetryAt: input?.scheduledRetryAt === undefined
+        ? new Date("2026-07-28T06:00:00.000Z")
+        : input.scheduledRetryAt,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "provider_quota",
+      contextSnapshot: {
+        issueId,
+        wakeReason: "scheduled_retry",
+        retryReason: "provider_quota",
+      },
+      createdAt,
+      updatedAt: createdAt,
+      ...(input?.runPatch ?? {}),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Legacy queued execution lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionAgentNameKey: "queuereaperagent",
+      executionLockedAt: createdAt,
+      createdAt,
+      updatedAt: createdAt,
+    });
+
+    return { companyId, agentId, issueId, runId, wakeupRequestId };
+  }
+
+  it("reaps the GOLAA-8387 shape once under concurrent and repeated invocation", async () => {
+    const seeded = await seedLockedQueuedRun();
+
+    const [left, right] = await Promise.all([
+      heartbeat.reapStaleQueuedExecutionLocks({ now }),
+      heartbeat.reapStaleQueuedExecutionLocks({ now }),
+    ]);
+    const repeated = await heartbeat.reapStaleQueuedExecutionLocks({ now });
+
+    expect(left.reaped + right.reaped).toBe(1);
+    expect(repeated).toEqual({ reaped: 0, runIds: [], issueIds: [] });
+
+    const [run, wakeup, issue, events, activities] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)).then((rows) => rows[0]),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeupRequestId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, seeded.issueId)).then((rows) => rows[0]),
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, seeded.runId)),
+      db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.stale_queued_execution_lock_reaped")),
+    ]);
+
+    expect(run).toMatchObject({
+      status: "cancelled",
+      errorCode: STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE,
+      finishedAt: now,
+    });
+    expect(run?.resultJson).toMatchObject({
+      stopReason: STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE,
+      timeoutSource: "stale_queued_execution_lock_reaper",
+      timeoutFired: true,
+    });
+    expect(wakeup).toMatchObject({ status: "cancelled", finishedAt: now });
+    expect(issue).toMatchObject({
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ eventType: "lifecycle", level: "warn" });
+    expect(activities).toHaveLength(1);
+    expect(activities[0]).toMatchObject({
+      entityType: "issue",
+      entityId: seeded.issueId,
+      runId: seeded.runId,
+    });
+  });
+
+  it("does not reap a future-dated scheduled retry", async () => {
+    const seeded = await seedLockedQueuedRun({
+      scheduledRetryAt: new Date("2026-07-29T13:00:00.000Z"),
+    });
+
+    const result = await heartbeat.reapStaleQueuedExecutionLocks({ now });
+
+    expect(result).toEqual({ reaped: 0, runIds: [], issueIds: [] });
+    const [run, wakeup, issue] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)).then((rows) => rows[0]),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeupRequestId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, seeded.issueId)).then((rows) => rows[0]),
+    ]);
+    expect(run?.status).toBe("queued");
+    expect(wakeup?.status).toBe("queued");
+    expect(issue?.executionRunId).toBe(seeded.runId);
+  });
+
+  it("does not reap recently queued ordinary work", async () => {
+    const seeded = await seedLockedQueuedRun({
+      createdAt: new Date("2026-07-29T11:58:00.000Z"),
+      scheduledRetryAt: null,
+      runPatch: {
+        invocationSource: "assignment",
+        scheduledRetryAttempt: 0,
+        scheduledRetryReason: null,
+      },
+    });
+
+    const result = await heartbeat.reapStaleQueuedExecutionLocks({ now });
+
+    expect(result.reaped).toBe(0);
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.runId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("queued");
+  });
+
+  it("is a no-op when a claim wins after stale-candidate discovery", async () => {
+    const seeded = await seedLockedQueuedRun();
+    const lockReady = deferred();
+    const allowClaim = deferred();
+
+    const claimTransaction = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from heartbeat_runs where id = ${seeded.runId} for update`);
+      lockReady.resolve();
+      await allowClaim.promise;
+      await tx
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: now, updatedAt: now })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      await tx
+        .update(agentWakeupRequests)
+        .set({ status: "claimed", claimedAt: now, updatedAt: now })
+        .where(eq(agentWakeupRequests.id, seeded.wakeupRequestId));
+    });
+
+    await lockReady.promise;
+    const reapPromise = heartbeat.reapStaleQueuedExecutionLocks({ now });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    allowClaim.resolve();
+    await claimTransaction;
+    const result = await reapPromise;
+
+    expect(result.reaped).toBe(0);
+    const [run, wakeup, issue, activities] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)).then((rows) => rows[0]),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeupRequestId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, seeded.issueId)).then((rows) => rows[0]),
+      db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.stale_queued_execution_lock_reaped")),
+    ]);
+    expect(run).toMatchObject({ status: "running", startedAt: now });
+    expect(wakeup).toMatchObject({ status: "claimed", claimedAt: now });
+    expect(issue?.executionRunId).toBe(seeded.runId);
+    expect(activities).toHaveLength(0);
+  });
+
+  it("preserves a changed issue lock when the pointer changes after candidate discovery", async () => {
+    const seeded = await seedLockedQueuedRun();
+    const replacementRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: replacementRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      startedAt: now,
+      contextSnapshot: { issueId: seeded.issueId },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const lockReady = deferred();
+    const allowLockChange = deferred();
+    const lockChangeTransaction = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${seeded.issueId} for update`);
+      lockReady.resolve();
+      await allowLockChange.promise;
+      await tx
+        .update(issues)
+        .set({ executionRunId: replacementRunId, executionLockedAt: now, updatedAt: now })
+        .where(eq(issues.id, seeded.issueId));
+    });
+
+    await lockReady.promise;
+    const reapPromise = heartbeat.reapStaleQueuedExecutionLocks({ now });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    allowLockChange.resolve();
+    await lockChangeTransaction;
+    const result = await reapPromise;
+
+    expect(result.reaped).toBe(0);
+    const [staleRun, wakeup, issue, events] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)).then((rows) => rows[0]),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeupRequestId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, seeded.issueId)).then((rows) => rows[0]),
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, seeded.runId)),
+    ]);
+    expect(staleRun?.status).toBe("queued");
+    expect(wakeup?.status).toBe("queued");
+    expect(issue?.executionRunId).toBe(replacementRunId);
+    expect(events).toHaveLength(0);
+  });
+});
