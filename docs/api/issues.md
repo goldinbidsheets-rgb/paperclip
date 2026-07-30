@@ -68,6 +68,8 @@ Updatable fields: `title`, `description`, `status`, `priority`, `assigneeAgentId
 
 For `PATCH /api/issues/{issueId}`, `assigneeAgentId` may be either the agent UUID or the agent shortname/urlKey within the same company.
 
+In `local_trusted` mode, the browser UI may call this endpoint and `POST /api/issues/{issueId}/comments` through trusted same-origin context. Non-browser clients must authenticate for both routes; a headerless request returns `401`. Origin/Referer is an intent signal inside the trusted-loopback model, not standalone authentication for exposed deployments.
+
 ## Checkout (Claim Task)
 
 ```

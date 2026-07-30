@@ -76,3 +76,19 @@ export function boardMutationGuard(): RequestHandler {
     next();
   };
 }
+
+export function localImplicitIssueMutationGuard(): RequestHandler {
+  return (req, res, next) => {
+    if (req.actor.type !== "board" || req.actor.source !== "local_implicit") {
+      next();
+      return;
+    }
+
+    if (!isTrustedBoardMutationRequest(req)) {
+      res.status(401).json({ error: "Authentication required for this issue mutation" });
+      return;
+    }
+
+    next();
+  };
+}
