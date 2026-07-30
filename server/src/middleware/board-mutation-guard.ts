@@ -77,15 +77,20 @@ export function boardMutationGuard(): RequestHandler {
   };
 }
 
-export function localImplicitIssueMutationGuard(): RequestHandler {
+export function localImplicitMutationGuard(): RequestHandler {
   return (req, res, next) => {
+    if (SAFE_METHODS.has(req.method.toUpperCase())) {
+      next();
+      return;
+    }
+
     if (req.actor.type !== "board" || req.actor.source !== "local_implicit") {
       next();
       return;
     }
 
     if (!isTrustedBoardMutationRequest(req)) {
-      res.status(401).json({ error: "Authentication required for this issue mutation" });
+      res.status(401).json({ error: "Authentication required for this mutation" });
       return;
     }
 

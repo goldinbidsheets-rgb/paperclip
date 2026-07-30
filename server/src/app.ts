@@ -10,7 +10,7 @@ import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import {
   boardMutationGuard,
-  localImplicitIssueMutationGuard,
+  localImplicitMutationGuard,
 } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
@@ -353,8 +353,7 @@ export async function createApp(
 
   // Mount API routes
   const api = Router();
-  api.patch("/issues/:id", localImplicitIssueMutationGuard());
-  api.post("/issues/:id/comments", localImplicitIssueMutationGuard());
+  api.use(localImplicitMutationGuard());
   api.use(boardMutationGuard());
   api.use(
     "/health",
