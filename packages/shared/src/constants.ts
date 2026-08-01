@@ -92,6 +92,18 @@ export const ADAPTER_AGNOSTIC_KEYS = [
 ] as const;
 export type AdapterAgnosticKey = (typeof ADAPTER_AGNOSTIC_KEYS)[number];
 
+const ADAPTER_AGNOSTIC_KEY_SET = new Set<string>(ADAPTER_AGNOSTIC_KEYS);
+
+/**
+ * Returns whether an adapter-config key belongs to Paperclip/company state and
+ * must survive a change of adapter type. API-only secret grants use a dynamic
+ * `access.*` namespace, so they cannot be represented in the fixed key list.
+ * Same-adapter replacement remains the explicit path for revoking those grants.
+ */
+export function isAdapterConfigKeyPreservedAcrossAdapterTypes(key: string) {
+  return ADAPTER_AGNOSTIC_KEY_SET.has(key) || key.startsWith("access.");
+}
+
 export const MODEL_PROFILE_KEYS = ["cheap"] as const;
 export type ModelProfileKey = (typeof MODEL_PROFILE_KEYS)[number];
 

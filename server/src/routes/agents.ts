@@ -7,12 +7,12 @@ import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
-  ADAPTER_AGNOSTIC_KEYS,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
   createAgentHireSchema,
   createAgentSchema,
   deriveAgentUrlKey,
+  isAdapterConfigKeyPreservedAcrossAdapterTypes,
   isUuidLike,
   normalizeIssueIdentifier,
   resetAgentSessionSchema,
@@ -1528,13 +1528,36 @@ export function agentRoutes(
     );
   }
 
-  function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
+  function isAgentAccessConfigKey(key: string) {
+    return key.startsWith("access.");
+  }
+
+  function countAgentAccessGrants(adapterConfig: Record<string, unknown>) {
+    return Object.keys(adapterConfig).filter(isAgentAccessConfigKey).length;
+  }
+
+  function summarizeAgentUpdateDetails(
+    patch: Record<string, unknown>,
+    adapterConfigAudit?: {
+      replacementRequested: boolean;
+      before: Record<string, unknown>;
+      after: Record<string, unknown>;
+    },
+  ) {
     const changedTopLevelKeys = Object.keys(patch).sort();
     const details: Record<string, unknown> = { changedTopLevelKeys };
 
     const adapterConfigPatch = asRecord(patch.adapterConfig);
     if (adapterConfigPatch) {
-      details.changedAdapterConfigKeys = Object.keys(adapterConfigPatch).sort();
+      details.changedAdapterConfigKeys = Object.keys(adapterConfigPatch)
+        .filter((key) => !isAgentAccessConfigKey(key))
+        .sort();
+    }
+
+    if (adapterConfigAudit) {
+      details.adapterConfigReplacementRequested = adapterConfigAudit.replacementRequested;
+      details.accessGrantCountBefore = countAgentAccessGrants(adapterConfigAudit.before);
+      details.accessGrantCountAfter = countAgentAccessGrants(adapterConfigAudit.after);
     }
 
     const runtimeConfigPatch = asRecord(patch.runtimeConfig);
@@ -3023,8 +3046,8 @@ export function agentRoutes(
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
+    const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
     if (touchesAdapterConfiguration) {
-      const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
       const changingAdapterType =
         typeof patchData.adapterType === "string" && patchData.adapterType !== existing.adapterType;
       const requestedAdapterConfig = hasOwn(patchData, "adapterConfig")
@@ -3044,13 +3067,14 @@ export function agentRoutes(
         rawEffectiveAdapterConfig = { ...existingAdapterConfig, ...requestedAdapterConfig };
       }
       if (changingAdapterType) {
-        // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
-        // when the adapter type changes. Without this, a PATCH that includes
-        // adapterConfig but omits these keys would silently drop them.
-        for (const key of ADAPTER_AGNOSTIC_KEYS) {
+        // Preserve adapter-agnostic keys (env, cwd, etc.) and dynamic access.*
+        // grants when the adapter type changes. Without this, a PATCH that
+        // includes adapterConfig but omits these keys would silently drop them.
+        for (const [key, existingValue] of Object.entries(existingAdapterConfig)) {
+          if (!isAdapterConfigKeyPreservedAcrossAdapterTypes(key)) continue;
           if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
-          if (rawEffectiveAdapterConfig[key] === undefined && existingAdapterConfig[key] !== undefined) {
-            rawEffectiveAdapterConfig = { ...rawEffectiveAdapterConfig, [key]: existingAdapterConfig[key] };
+          if (rawEffectiveAdapterConfig[key] === undefined && existingValue !== undefined) {
+            rawEffectiveAdapterConfig = { ...rawEffectiveAdapterConfig, [key]: existingValue };
           }
         }
         rawEffectiveAdapterConfig = preserveInstructionsBundleConfig(
@@ -3128,7 +3152,16 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: summarizeAgentUpdateDetails(
+        patchData,
+        touchesAdapterConfiguration
+          ? {
+              replacementRequested: replaceAdapterConfig,
+              before: existingAdapterConfig,
+              after: asRecord(agent.adapterConfig) ?? {},
+            }
+          : undefined,
+      ),
     });
 
     res.json(agent);

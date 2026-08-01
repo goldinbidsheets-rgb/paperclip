@@ -1,4 +1,4 @@
-import { ADAPTER_AGNOSTIC_KEYS, type Agent } from "@paperclipai/shared";
+import { isAdapterConfigKeyPreservedAcrossAdapterTypes, type Agent } from "@paperclipai/shared";
 
 export interface AgentModelProfileOverlay {
   enabled?: boolean;
@@ -42,9 +42,10 @@ export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay)
       overlay.adapterType !== undefined
         ? {
             ...Object.fromEntries(
-              ADAPTER_AGNOSTIC_KEYS
-                .filter((key) => existing[key] !== undefined)
-                .map((key) => [key, existing[key]]),
+              Object.entries(existing).filter(
+                ([key, value]) => value !== undefined
+                  && isAdapterConfigKeyPreservedAcrossAdapterTypes(key),
+              ),
             ),
             ...overlay.adapterConfig,
           }

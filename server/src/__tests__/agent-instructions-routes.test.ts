@@ -497,6 +497,144 @@ describe("agent instructions bundle routes", () => {
     );
   });
 
+  it("preserves access grants across an adapter switch and logs only counts", async () => {
+    const crmGrant = {
+      type: "secret_ref",
+      secretId: "secret-ref-crm",
+      version: "latest",
+    };
+    const inventoryGrant = {
+      type: "secret_ref",
+      secretId: "secret-ref-inventory",
+      version: "latest",
+    };
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterType: "claude_local",
+      adapterConfig: {
+        model: "claude-sonnet-4",
+        permissionMode: "legacy-adapter-setting",
+        "access.CRM_READ": crmGrant,
+        "access.INVENTORY_WRITE": inventoryGrant,
+      },
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        adapterType: "codex_local",
+        replaceAdapterConfig: true,
+        adapterConfig: {
+          model: "gpt-5.4",
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatePatch = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const updatedConfig = updatePatch.adapterConfig as Record<string, unknown>;
+    expect(updatedConfig).toMatchObject({
+      model: "gpt-5.4",
+      "access.CRM_READ": crmGrant,
+      "access.INVENTORY_WRITE": inventoryGrant,
+    });
+    expect(updatedConfig.permissionMode).toBeUndefined();
+
+    const activity = mockLogActivity.mock.calls.at(-1)?.[1] as { details: Record<string, unknown> };
+    expect(activity.details).toMatchObject({
+      adapterConfigReplacementRequested: true,
+      accessGrantCountBefore: 2,
+      accessGrantCountAfter: 2,
+    });
+    expect((activity.details.changedAdapterConfigKeys as string[]).every((key) => !key.startsWith("access."))).toBe(true);
+    expect(JSON.stringify(activity.details)).not.toContain("CRM_READ");
+    expect(JSON.stringify(activity.details)).not.toContain("secret-ref-crm");
+  });
+
+  it("keeps same-adapter merge behavior for access grants", async () => {
+    const keepGrant = {
+      type: "secret_ref",
+      secretId: "secret-ref-keep",
+      version: "latest",
+    };
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterType: "codex_local",
+      adapterConfig: {
+        model: "gpt-5.4",
+        "access.KEEP": keepGrant,
+      },
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        adapterConfig: {
+          command: "codex --profile engineer",
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatePatch = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(updatePatch.adapterConfig).toMatchObject({
+      model: "gpt-5.4",
+      command: "codex --profile engineer",
+      "access.KEEP": keepGrant,
+    });
+    const activity = mockLogActivity.mock.calls.at(-1)?.[1] as { details: Record<string, unknown> };
+    expect(activity.details).toMatchObject({
+      adapterConfigReplacementRequested: false,
+      accessGrantCountBefore: 1,
+      accessGrantCountAfter: 1,
+    });
+  });
+
+  it("allows same-adapter replacement to revoke an access grant", async () => {
+    const keepGrant = {
+      type: "secret_ref",
+      secretId: "secret-ref-keep",
+      version: "latest",
+    };
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterType: "codex_local",
+      adapterConfig: {
+        model: "gpt-5.4",
+        "access.KEEP": keepGrant,
+        "access.REVOKE": {
+          type: "secret_ref",
+          secretId: "secret-ref-revoke",
+          version: "latest",
+        },
+      },
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({
+        replaceAdapterConfig: true,
+        adapterConfig: {
+          model: "gpt-5.4",
+          "access.KEEP": keepGrant,
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatePatch = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(updatePatch.adapterConfig).toMatchObject({
+      model: "gpt-5.4",
+      "access.KEEP": keepGrant,
+    });
+    expect((updatePatch.adapterConfig as Record<string, unknown>)["access.REVOKE"]).toBeUndefined();
+    const activity = mockLogActivity.mock.calls.at(-1)?.[1] as { details: Record<string, unknown> };
+    expect(activity.details).toMatchObject({
+      adapterConfigReplacementRequested: true,
+      accessGrantCountBefore: 2,
+      accessGrantCountAfter: 1,
+    });
+    expect(JSON.stringify(activity.details)).not.toContain("REVOKE");
+    expect(JSON.stringify(activity.details)).not.toContain("secret-ref-revoke");
+  });
+
   it("merges same-adapter config patches so instructions metadata is not dropped", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),

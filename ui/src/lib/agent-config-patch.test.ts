@@ -221,6 +221,79 @@ describe("buildAgentUpdatePatch", () => {
     });
   });
 
+  it("preserves every access grant while replacing adapter-specific fields", () => {
+    const agent = makeAgent();
+    agent.adapterConfig = {
+      ...agent.adapterConfig,
+      permissionMode: "legacy-adapter-setting",
+      "access.CRM_READ": {
+        type: "secret_ref",
+        secretId: "secret-ref-crm",
+        version: "latest",
+      },
+      "access.INVENTORY_WRITE": {
+        type: "secret_ref",
+        secretId: "secret-ref-inventory",
+        version: "latest",
+      },
+    };
+
+    const patch = buildAgentUpdatePatch(
+      agent,
+      makeOverlay({
+        adapterType: "codex_local",
+        adapterConfig: {
+          model: "gpt-5.4",
+          dangerouslyBypassApprovalsAndSandbox: true,
+        },
+      }),
+    );
+
+    expect(patch).toMatchObject({
+      adapterType: "codex_local",
+      replaceAdapterConfig: true,
+      adapterConfig: {
+        model: "gpt-5.4",
+        "access.CRM_READ": agent.adapterConfig["access.CRM_READ"],
+        "access.INVENTORY_WRITE": agent.adapterConfig["access.INVENTORY_WRITE"],
+      },
+    });
+    expect((patch.adapterConfig as Record<string, unknown>).permissionMode).toBeUndefined();
+  });
+
+  it("keeps same-adapter access-editor deletion explicit", () => {
+    const agent = makeAgent();
+    agent.adapterConfig = {
+      ...agent.adapterConfig,
+      "access.KEEP": {
+        type: "secret_ref",
+        secretId: "secret-ref-keep",
+        version: "latest",
+      },
+      "access.REVOKE": {
+        type: "secret_ref",
+        secretId: "secret-ref-revoke",
+        version: "latest",
+      },
+    };
+
+    const patch = buildAgentUpdatePatch(
+      agent,
+      makeOverlay({
+        adapterConfig: {
+          "access.REVOKE": undefined,
+        },
+      }),
+    );
+
+    expect(patch.replaceAdapterConfig).toBe(true);
+    expect(patch.adapterType).toBeUndefined();
+    expect(patch.adapterConfig).toMatchObject({
+      "access.KEEP": agent.adapterConfig["access.KEEP"],
+    });
+    expect((patch.adapterConfig as Record<string, unknown>)["access.REVOKE"]).toBeUndefined();
+  });
+
   it("preserves paperclip skill-sync selections when changing adapter types", () => {
     // Desired skills are adapter-agnostic (company-level selections) but are
     // persisted inside the per-adapter config under `paperclipSkillSync`. A

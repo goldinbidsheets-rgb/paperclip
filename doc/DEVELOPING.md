@@ -758,6 +758,13 @@ those providers are enabled.
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.
 
+Adapter-type changes preserve every existing top-level `access.*` secret-ref
+binding, including requests that use `replaceAdapterConfig: true`. Grant
+revocation remains an explicit same-adapter operation through the secret-access
+editor (or an equivalent complete same-adapter replacement). `agent.updated`
+activity records the replacement request and numeric before/after access-grant
+counts while omitting dynamic access-key names and secret-reference metadata.
+
 - Default local key path: `~/.paperclip/instances/default/secrets/master.key`
 - Override key material directly: `PAPERCLIP_SECRETS_MASTER_KEY`
 - Override key file path: `PAPERCLIP_SECRETS_MASTER_KEY_FILE`
