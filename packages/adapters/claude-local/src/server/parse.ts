@@ -13,6 +13,9 @@ const CLAUDE_TRANSIENT_UPSTREAM_RE =
   /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
 const CLAUDE_PROVIDER_QUOTA_RE =
   /(?:you(?:'|’)ve\s+hit\s+your\s+(?:session|weekly|monthly)\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|servicequotaexceededexception)/i;
+const CLAUDE_OVERFLOW_HOLD_RE =
+  /(?:^|\r?\n)(\[claude-overflow\] HOLD: subscription session limit active; skipping launch until reset\b[^\r\n]*)/i;
+const CLAUDE_OVERFLOW_HOLD_RESET_EPOCH_RE = /\bresetEpoch=(\d{10})\b/i;
 const CLAUDE_MODEL_NOT_FOUND_RE =
   /(?:\b404\b[\s\S]{0,120})?(?:model[\s_-]*(?:not[\s_-]*found|does not exist|unknown|invalid)|unknown[\s_-]*model)/i;
 const CLAUDE_EXTRA_USAGE_RESET_RE =
@@ -310,6 +313,28 @@ function buildClaudeTransientHaystack(input: {
     .map((line) => line.trim())
     .filter(Boolean)
     .join("\n");
+}
+
+export function detectClaudeOverflowHold(stderr: string): {
+  message: string;
+  retryNotBefore: Date | null;
+} | null {
+  // Only the wrapper's anchored stderr line is authoritative. Searching stdout
+  // would let ordinary agent output that quotes the sentinel become a false HOLD.
+  const holdMatch = stderr.match(CLAUDE_OVERFLOW_HOLD_RE);
+  const message = holdMatch?.[1]?.trim();
+  if (!message) return null;
+
+  const resetEpoch = message.match(CLAUDE_OVERFLOW_HOLD_RESET_EPOCH_RE)?.[1];
+  const retryNotBefore = resetEpoch
+    ? new Date(Number.parseInt(resetEpoch, 10) * 1_000)
+    : null;
+  return {
+    message,
+    retryNotBefore: retryNotBefore && Number.isFinite(retryNotBefore.getTime())
+      ? retryNotBefore
+      : null,
+  };
 }
 
 function readTimeZoneParts(date: Date, timeZone: string) {

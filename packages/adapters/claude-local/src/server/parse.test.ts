@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   claudeModelUsageTotals,
   parseClaudeStreamJson,
+  detectClaudeOverflowHold,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeProviderQuotaError,
@@ -32,6 +33,26 @@ describe("detectClaudeLoginRequired", () => {
         stderr: "Invalid API key",
       }).requiresLogin,
     ).toBe(false);
+  });
+});
+
+describe("detectClaudeOverflowHold", () => {
+  it("recognizes only the wrapper stderr sentinel and preserves its reset epoch", () => {
+    const message =
+      "[claude-overflow] HOLD: subscription session limit active; skipping launch until reset; resetEpoch=1900000000 (this run is a zero-token no-op).";
+
+    expect(detectClaudeOverflowHold(`${message}\n`)).toEqual({
+      message,
+      retryNotBefore: new Date(1_900_000_000 * 1_000),
+    });
+    expect(detectClaudeOverflowHold("Docs mention a subscription session limit.")).toBeNull();
+  });
+
+  it("still recognizes the historical sentinel when reset metadata is absent", () => {
+    const message =
+      "[claude-overflow] HOLD: subscription session limit active; skipping launch until reset (this run is a zero-token no-op).";
+
+    expect(detectClaudeOverflowHold(message)).toEqual({ message, retryNotBefore: null });
   });
 });
 
