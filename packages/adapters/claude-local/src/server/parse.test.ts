@@ -87,6 +87,21 @@ describe("isClaudeTransientUpstreamError", () => {
     );
   });
 
+  it("classifies a success-envelope weekly limit and extracts its calendar reset", () => {
+    const now = new Date("2026-08-01T12:00:00.000Z");
+    const parsed = {
+      subtype: "success",
+      is_error: false,
+      result: "You've hit your weekly limit - resets Aug 5, 7am (America/New_York)",
+    };
+
+    expect(isClaudeProviderQuotaError({ parsed })).toBe(true);
+    expect(isClaudeTransientUpstreamError({ parsed })).toBe(false);
+    expect(extractClaudeRetryNotBefore({ parsed }, now)?.toISOString()).toBe(
+      "2026-08-05T11:00:00.000Z",
+    );
+  });
+
   it("classifies Anthropic API rate_limit_error and overloaded_error as transient", () => {
     expect(
       isClaudeTransientUpstreamError({
@@ -359,6 +374,17 @@ describe("extractClaudeRetryNotBefore", () => {
       now,
     );
     expect(extracted?.toISOString()).toBe("2026-04-23T03:15:00.000Z");
+  });
+
+  it("does not roll a stale calendar reset into the following year", () => {
+    const extracted = extractClaudeRetryNotBefore(
+      {
+        errorMessage:
+          "You've hit your weekly limit - resets Aug 5, 7am (America/New_York)",
+      },
+      new Date("2026-08-05T11:01:00.000Z"),
+    );
+    expect(extracted).toBeNull();
   });
 
   it("returns null when no reset hint is present", () => {

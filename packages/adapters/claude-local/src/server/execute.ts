@@ -1072,8 +1072,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const claudeRefusal = isClaudeRefusalResult(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
     const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
-    const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
-    const failed = !parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
+    const zeroTokenResult =
+      usage.inputTokens === 0 && usage.cachedInputTokens === 0 && usage.outputTokens === 0;
+    // Claude can wrap a subscription refusal in subtype=success. Keep the guard
+    // narrow so ordinary successful output that discusses quotas remains valid.
+    const successfulQuotaRefusal =
+      parsedSubtype === "success" &&
+      !parsedIsError &&
+      zeroTokenResult &&
+      isClaudeProviderQuotaError({
+        parsed,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+      });
+    const parsedSucceeded =
+      parsedSubtype === "success" && !parsedIsError && !successfulQuotaRefusal;
+    const failed =
+      successfulQuotaRefusal ||
+      (!parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError));
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed

@@ -1474,6 +1474,78 @@ describe("claude execute", () => {
     }
   });
 
+  it("treats a zero-token weekly-limit success envelope as provider quota", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-weekly-limit-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, process.platform === "win32" ? "claude.cmd" : "claude");
+    const scriptPath = process.platform === "win32" ? path.join(root, "claude.js") : commandPath;
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(scriptPath, {
+      exitCode: 1,
+      resultEvent: {
+        type: "result",
+        subtype: "success",
+        session_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        is_error: false,
+        result: "You've hit your weekly limit - resets Aug 5, 7am (America/New_York)",
+        usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    });
+    if (process.platform === "win32") {
+      await fs.writeFile(
+        commandPath,
+        `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`,
+        "utf8",
+      );
+    }
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T12:00:00.000Z"));
+
+    try {
+      const result = await execute({
+        runId: "run-claude-weekly-limit",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      const expectedRetryNotBefore = "2026-08-05T11:00:00.000Z";
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("provider_quota");
+      expect(result.errorFamily).toBe("provider_quota");
+      expect(result.retryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.resultJson?.providerQuotaRetryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.errorMessage ?? "").toContain("weekly limit");
+    } finally {
+      vi.useRealTimers();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("classifies rate-limit / overloaded failures without reset metadata as transient", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-rate-limit-"));
     const workspace = path.join(root, "workspace");
