@@ -7529,9 +7529,14 @@ export function issueService(db: Db) {
       const sameRunAssigneeCondition = checkoutRunId
         ? and(
           eq(issues.assigneeAgentId, agentId),
+          isNull(issues.assigneeUserId),
           or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, checkoutRunId)),
         )
-        : and(eq(issues.assigneeAgentId, agentId), isNull(issues.checkoutRunId));
+        : and(
+          eq(issues.assigneeAgentId, agentId),
+          isNull(issues.assigneeUserId),
+          isNull(issues.checkoutRunId),
+        );
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
@@ -7550,7 +7555,10 @@ export function issueService(db: Db) {
           and(
             eq(issues.id, id),
             inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+            and(
+              isNull(issues.assigneeUserId),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+            ),
             executionLockCondition,
           ),
         )
@@ -7567,6 +7575,7 @@ export function issueService(db: Db) {
           id: issues.id,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
         })
@@ -7632,7 +7641,8 @@ export function issueService(db: Db) {
         checkoutRunId &&
         current.executionRunId &&
         current.executionRunId !== checkoutRunId &&
-        (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
+        (current.assigneeAgentId === agentId || current.assigneeAgentId == null) &&
+        current.assigneeUserId == null
       ) {
         const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId);
         if (stale) {
@@ -7658,7 +7668,8 @@ export function issueService(db: Db) {
                 inArray(issues.status, expectedStatuses),
                 eq(issues.executionRunId, current.executionRunId),
                 or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
-              ),
+                isNull(issues.assigneeUserId),
+              )
             )
             .returning()
             .then((rows) => rows[0] ?? null);

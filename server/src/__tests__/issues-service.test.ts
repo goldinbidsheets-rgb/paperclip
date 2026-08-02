@@ -5689,6 +5689,65 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       executionRunId: successorRunId,
     });
   });
+
+  it("does not allow checkout to overwrite a board/user-owned issue", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const checkoutRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date("2026-06-10T10:07:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Board action awaiting human reply",
+      status: "todo",
+      priority: "medium",
+      assigneeUserId: "local-board",
+    });
+
+    await expect(svc.checkout(issueId, agentId, ["todo", "backlog", "blocked"], checkoutRunId))
+      .rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeUserId: issues.assigneeUserId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({
+      status: "todo",
+      assigneeUserId: "local-board",
+      assigneeAgentId: null,
+    });
+  });
 });
 
 describeEmbeddedPostgres("accepted plan decomposition", () => {
