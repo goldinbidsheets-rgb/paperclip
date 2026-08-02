@@ -5596,13 +5596,10 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
-  it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
-    // Regression for PR #2482 checkout-adoption review finding: any adoption
-    // helper that re-locks an existing in_progress issue (e.g. when the prior
-    // checkout/execution run is terminal) must not strip the row's
-    // assigneeUserId. We exercise this via the adoptStaleCheckoutRun path,
-    // which fires when checkoutRunId points at a terminal run while
-    // executionRunId still points at a different, non-terminal run.
+  it("does not adopt a stale checkoutRunId when the issue has a user co-assignee", async () => {
+    // A human assignee is an execution boundary even on legacy rows that also
+    // carry an agent assignee. Stale-lock recovery must leave the row untouched
+    // rather than silently turning the human-owned issue into active agent work.
     const companyId = randomUUID();
     const agentId = randomUUID();
     const userId = randomUUID();
@@ -5667,8 +5664,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
     });
 
-    const result = await svc.checkout(issueId, agentId, ["todo", "in_progress"], successorRunId);
-    expect(result).toBeTruthy();
+    await expect(svc.checkout(issueId, agentId, ["todo", "in_progress"], successorRunId))
+      .rejects.toMatchObject({ status: 409 });
 
     const row = await db
       .select({
@@ -5685,8 +5682,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       status: "in_progress",
       assigneeAgentId: agentId,
       assigneeUserId: userId,
-      checkoutRunId: successorRunId,
-      executionRunId: successorRunId,
+      checkoutRunId: failedCheckoutRunId,
+      executionRunId: queuedExecutionRunId,
     });
   });
 
