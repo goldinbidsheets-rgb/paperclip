@@ -34,6 +34,29 @@ describe("errorHandler", () => {
     recordResponsibleUserDenialOnActiveRunMock.mockResolvedValue(null);
   });
 
+  it("returns an actionable 400 for malformed JSON request bodies", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const err = Object.assign(new SyntaxError("Unexpected token s in JSON at position 1"), {
+      status: 400,
+      statusCode: 400,
+      type: "entity.parse.failed",
+      body: "{status:done}",
+    });
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "Invalid JSON request body",
+      code: "invalid_json_body",
+      remediation: "Send a syntactically valid JSON object with Content-Type: application/json.",
+    });
+    expect(res.err).toBeUndefined();
+    expect(res.__errorContext).toBeUndefined();
+  });
+
   it("attaches the original Error to res.err for 500s", () => {
     const req = makeReq();
     const res = makeRes() as any;

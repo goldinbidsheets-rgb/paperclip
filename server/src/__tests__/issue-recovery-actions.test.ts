@@ -23,6 +23,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { actorMiddleware } from "../middleware/auth.js";
+import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
@@ -127,8 +129,10 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("issue recovery actions", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
+  const previousAgentJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
 
   beforeAll(async () => {
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "issue-recovery-actions-test-secret";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-recovery-actions-");
     db = createDb(tempDb.connectionString);
   }, 30_000);
@@ -149,6 +153,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    if (previousAgentJwtSecret === undefined) {
+      delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    } else {
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = previousAgentJwtSecret;
+    }
   });
 
   async function seedCompany() {
@@ -231,6 +240,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       next();
     });
     app.use("/api", issueRoutes(db, {} as any, opts));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function createAuthenticatedApp() {
+    const app = express();
+    app.use(express.json());
+    app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+    app.use("/api", issueRoutes(db, {} as any));
     app.use(errorHandler);
     return app;
   }
@@ -1606,6 +1624,132 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       source: "source_revalidation",
       trigger: "issue_update",
     });
+  });
+
+  it("lets a run-scoped agent JWT close its blocked routine sibling without fighting peer-owned siblings", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const routineId = randomUUID();
+    const siblingIssueId = randomUUID();
+    const peerBlockedIssueId = randomUUID();
+    const peerActiveIssueId = randomUUID();
+    await db
+      .update(issues)
+      .set({ originKind: "routine_execution", originId: routineId })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(issues).values([
+      {
+        id: siblingIssueId,
+        companyId,
+        title: "Prior blocked routine fire",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: 2,
+        identifier: `${prefix}-2`,
+        originKind: "routine_execution",
+        originId: routineId,
+      },
+      {
+        id: peerBlockedIssueId,
+        companyId,
+        title: "Peer-owned blocked routine fire",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: managerId,
+        issueNumber: 3,
+        identifier: `${prefix}-3`,
+        originKind: "routine_execution",
+        originId: routineId,
+      },
+      {
+        id: peerActiveIssueId,
+        companyId,
+        title: "Peer-owned active routine fire",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: managerId,
+        issueNumber: 4,
+        identifier: `${prefix}-4`,
+        originKind: "routine_execution",
+        originId: routineId,
+      },
+    ]);
+    const recoveryAction = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId: siblingIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "process_lost",
+      fingerprint: `stranded-assigned-issue:${siblingIssueId}`,
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const runId = randomUUID();
+    await seedHeartbeatRun({
+      companyId,
+      agentId: coderId,
+      runId,
+      issueId: sourceIssueId,
+    });
+    const token = createLocalAgentJwt(
+      coderId,
+      companyId,
+      "codex_local",
+      runId,
+      "local-board",
+    );
+    const app = createAuthenticatedApp();
+    const patchAsRun = (issueId: string) => request(app)
+      .patch(`/api/issues/${issueId}`)
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", runId);
+
+    const malformed = await patchAsRun(siblingIssueId)
+      .set("Content-Type", "application/json")
+      .send("{status:done}");
+    expect(malformed.status).toBe(400);
+    expect(malformed.body).toEqual({
+      error: "Invalid JSON request body",
+      code: "invalid_json_body",
+      remediation: "Send a syntactically valid JSON object with Content-Type: application/json.",
+    });
+    expect(
+      await db.select({ status: issues.status }).from(issues).where(eq(issues.id, siblingIssueId)),
+    ).toEqual([{ status: "blocked" }]);
+
+    const peerBlocked = await patchAsRun(peerBlockedIssueId).send({ status: "done" });
+    expect(peerBlocked.status).toBe(403);
+    expect(peerBlocked.body.error).toBe("Agent cannot mutate another agent's issue");
+
+    const peerActive = await patchAsRun(peerActiveIssueId).send({ status: "done" });
+    expect(peerActive.status).toBe(409);
+    expect(peerActive.body.error).toBe("Issue is checked out by another agent");
+
+    const closed = await patchAsRun(siblingIssueId).send({ status: "done" });
+    expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+    expect(closed.body).toMatchObject({
+      id: siblingIssueId,
+      status: "done",
+      activeRecoveryAction: null,
+    });
+    expect(
+      await db.select({ status: issues.status }).from(issues).where(eq(issues.id, peerBlockedIssueId)),
+    ).toEqual([{ status: "blocked" }]);
+    expect(
+      await db.select({ status: issues.status }).from(issues).where(eq(issues.id, peerActiveIssueId)),
+    ).toEqual([{ status: "in_progress" }]);
+    expect(
+      await db.select().from(issueComments).where(eq(issueComments.issueId, siblingIssueId)),
+    ).toHaveLength(0);
+    expect(
+      await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, recoveryAction.id)),
+    ).toEqual([
+      expect.objectContaining({ status: "cancelled", outcome: "cancelled" }),
+    ]);
   });
 
   it("folds stale recovery during read projection after the source issue reaches done", async () => {

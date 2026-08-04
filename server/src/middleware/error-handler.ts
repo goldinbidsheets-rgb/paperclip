@@ -23,6 +23,21 @@ function isRedactedSkillPolicyDenial(details: Record<string, unknown> | null) {
   return details?.code === "skill_policy_denied";
 }
 
+function isJsonBodyParseError(error: unknown): error is SyntaxError & {
+  status?: number;
+  statusCode?: number;
+  type?: string;
+} {
+  if (!(error instanceof Error) || error.name !== "SyntaxError") return false;
+  const candidate = error as SyntaxError & {
+    status?: number;
+    statusCode?: number;
+    type?: string;
+  };
+  return candidate.type === "entity.parse.failed"
+    && (candidate.status === 400 || candidate.statusCode === 400);
+}
+
 function attachErrorContext(
   req: Request,
   res: Response,
@@ -78,6 +93,15 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  if (isJsonBodyParseError(err)) {
+    res.status(400).json({
+      error: "Invalid JSON request body",
+      code: "invalid_json_body",
+      remediation: "Send a syntactically valid JSON object with Content-Type: application/json.",
+    });
+    return;
+  }
+
   if (err instanceof HttpError) {
     const details = err.details && typeof err.details === "object" && !Array.isArray(err.details)
       ? err.details as Record<string, unknown>
