@@ -17,6 +17,7 @@ const mockInteractionService = vi.hoisted(() => ({
   rejectInteraction: vi.fn(),
   rejectSuggestedTasks: vi.fn(),
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(),
+  expirePendingInteractionsForTerminalIssue: vi.fn(),
   answerQuestions: vi.fn(),
   submitItemVerdicts: vi.fn(),
   cancelQuestions: vi.fn(),
@@ -186,6 +187,7 @@ describe.sequential("issue thread interaction routes", () => {
     mockIssueService.getById.mockResolvedValue(createIssue());
     mockInteractionService.listForIssue.mockResolvedValue([]);
     mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments.mockResolvedValue([]);
+    mockInteractionService.expirePendingInteractionsForTerminalIssue.mockResolvedValue([]);
     mockInteractionService.create.mockResolvedValue({
       id: "interaction-1",
       companyId: "company-1",
@@ -396,6 +398,10 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments).toHaveBeenCalledWith(
       expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
     );
+    expect(mockInteractionService.expirePendingInteractionsForTerminalIssue).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      expect.objectContaining({ userId: "local-board" }),
+    );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -431,6 +437,33 @@ describe.sequential("issue thread interaction routes", () => {
         details: expect.objectContaining({
           interactionId: "interaction-1",
           interactionKind: "suggest_tasks",
+        }),
+      }),
+    );
+  });
+
+  it("expires historical pending interactions when listing a closed issue", async () => {
+    mockIssueService.getById.mockResolvedValue(createIssue({ status: "done" }));
+    mockInteractionService.expirePendingInteractionsForTerminalIssue.mockResolvedValueOnce([{
+      id: "interaction-closed",
+      kind: "request_confirmation",
+      status: "expired",
+      result: { version: 1, outcome: "issue_closed", reason: null },
+    }]);
+    const app = await createApp();
+
+    const response = await request(app)
+      .get("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions");
+
+    expect(response.status).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.thread_interaction_expired",
+        details: expect.objectContaining({
+          interactionId: "interaction-closed",
+          source: "issue.interactions.catchup_issue_closed",
+          result: expect.objectContaining({ outcome: "issue_closed" }),
         }),
       }),
     );

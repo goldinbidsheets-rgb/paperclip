@@ -84,6 +84,7 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { logActivity } from "./activity-log.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -6651,6 +6652,34 @@ export function issueService(db: Db) {
           existing.status !== updated.status
         ) {
           await finalizeSummarySlotsForTerminalIssue(tx, updated);
+          // This is the central issue transition transaction used by direct
+          // service callers as well as HTTP routes. Expire the issue's pending
+          // governance cards here so no close path can strand a live action.
+          const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+          const expiredInteractions = await issueThreadInteractionService(tx)
+            .expirePendingInteractionsForTerminalIssue(updated, {
+              agentId: actorAgentId ?? null,
+              userId: actorUserId ?? null,
+            });
+          for (const interaction of expiredInteractions) {
+            await logActivity(tx as unknown as Db, {
+              companyId: updated.companyId,
+              actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
+              actorId: actorAgentId ?? actorUserId ?? "issue_service",
+              agentId: actorAgentId ?? null,
+              action: "issue.thread_interaction_expired",
+              entityType: "issue",
+              entityId: updated.id,
+              details: {
+                identifier: updated.identifier ?? null,
+                interactionId: interaction.id,
+                interactionKind: interaction.kind,
+                interactionStatus: interaction.status,
+                source: "issue.status_transition.issue_closed",
+                result: interaction.result ?? null,
+              },
+            });
+          }
         }
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);

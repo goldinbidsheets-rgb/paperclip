@@ -1,3 +1,4 @@
+import { getTableName } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockCreateChild = vi.fn();
@@ -33,6 +34,7 @@ function createFakeDb(args: {
   let interactionRow = { ...args.interactionRow };
   const issueTouches: Array<Record<string, unknown>> = [];
   const interactionUpdates: Array<Record<string, unknown>> = [];
+  const toolActionRequestUpdates: Array<Record<string, unknown>> = [];
   let selectCallCount = 0;
 
   const db: any = {
@@ -44,6 +46,10 @@ function createFakeDb(args: {
       set(values: Record<string, unknown>) {
         return {
           where() {
+            if (getTableName(table as never) === "tool_action_requests") {
+              toolActionRequestUpdates.push(values);
+              return Promise.resolve(undefined);
+            }
             if ("status" in values || "result" in values || "resolvedAt" in values) {
               interactionUpdates.push(values);
               interactionRow = { ...interactionRow, ...values };
@@ -69,6 +75,7 @@ function createFakeDb(args: {
     getInteractionRow: () => interactionRow,
     issueTouches,
     interactionUpdates,
+    toolActionRequestUpdates,
   };
 }
 
@@ -211,5 +218,93 @@ describe("issueThreadInteractionService", () => {
     });
     expect(state.interactionUpdates).toHaveLength(1);
     expect(state.issueTouches).toHaveLength(1);
+  });
+
+  it("expires pending interactions when the issue is terminal", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+    const interactionRow = {
+      id: "interaction-close",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-1",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [{
+          id: "q",
+          prompt: "Q?",
+          selectionMode: "single",
+          options: [{ id: "a", label: "A" }],
+        }],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-07-25T10:00:00.000Z"),
+      updatedAt: new Date("2026-07-25T10:00:00.000Z"),
+    };
+    const state = createFakeDb({ interactionRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const expired = await svc.expirePendingInteractionsForTerminalIssue({
+      id: interactionRow.issueId,
+      companyId: interactionRow.companyId,
+      status: "done",
+    });
+
+    expect(expired).toHaveLength(1);
+    expect(expired[0]).toMatchObject({
+      status: "expired",
+      result: { version: 1, outcome: "issue_closed", answers: [] },
+    });
+    expect(state.toolActionRequestUpdates).toHaveLength(0);
+  });
+
+  it("expires a linked tool action request with its closed confirmation", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+    const interactionRow = {
+      id: "interaction-tool",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-1",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: { version: 1, prompt: "Run the parked tool call?" },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-07-25T10:00:00.000Z"),
+      updatedAt: new Date("2026-07-25T10:00:00.000Z"),
+    };
+    const state = createFakeDb({ interactionRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const expired = await svc.expirePendingInteractionsForTerminalIssue({
+      id: interactionRow.issueId,
+      companyId: interactionRow.companyId,
+      status: "cancelled",
+    }, { userId: "local-board" });
+
+    expect(expired).toHaveLength(1);
+    expect(state.toolActionRequestUpdates).toHaveLength(1);
+    expect(state.toolActionRequestUpdates[0]).toMatchObject({
+      status: "expired",
+      resolvedByUserId: "local-board",
+    });
   });
 });

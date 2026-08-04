@@ -9014,6 +9014,16 @@ export function issueRoutes(
       actor,
       source: "issue.interactions.catchup_superseded_by_comment",
     });
+    const closedIssueInteractions = await interactionSvc.expirePendingInteractionsForTerminalIssue(issue, {
+      agentId: actor.agentId,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+    });
+    await logExpiredRequestConfirmations({
+      issue,
+      interactions: closedIssueInteractions,
+      actor,
+      source: "issue.interactions.catchup_issue_closed",
+    });
 
     const interactions = await interactionSvc.listForIssue(id);
     res.json(interactions);

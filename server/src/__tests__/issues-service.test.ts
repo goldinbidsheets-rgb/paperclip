@@ -464,6 +464,63 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("expires pending thread interactions on a service-level terminal transition", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const issue = await svc.create(companyId, {
+      title: "Close me with a pending card",
+      description: null,
+      status: "todo",
+      priority: "medium",
+    });
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId: issue.id,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Pick one",
+          selectionMode: "single",
+          options: [{ id: "a", label: "A" }],
+        }],
+      } as never,
+    });
+
+    const updated = await svc.update(issue.id, {
+      status: "cancelled",
+      actorUserId: "local-board",
+    });
+    expect(updated?.status).toBe("cancelled");
+
+    const interaction = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId))
+      .then((rows) => rows[0] ?? null);
+    expect(interaction).toMatchObject({
+      status: "expired",
+      resolvedByUserId: "local-board",
+      result: { version: 1, outcome: "issue_closed" },
+    });
+    expect(interaction?.resolvedAt).not.toBeNull();
+
+    const logged = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.thread_interaction_expired"));
+    expect(logged).toHaveLength(1);
+    expect(logged[0]?.details).toMatchObject({
+      interactionId,
+      interactionKind: "ask_user_questions",
+      interactionStatus: "expired",
+    });
+  });
+
   it("rejects moving an existing terminated assignment into progress without clearing it", async () => {
     const companyId = await seedAssignableAgentCompany();
     const assigneeAgentId = randomUUID();
