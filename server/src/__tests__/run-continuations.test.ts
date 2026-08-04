@@ -170,4 +170,22 @@ describe("run liveness continuations", () => {
       expect(decision.kind).toBe("skip");
     }
   });
+
+  it("does not immediately continue an upstream_throttled run", () => {
+    const decision = decideRunLivenessContinuation({
+      run: run(),
+      issue: issue(),
+      agent: agent(),
+      livenessState: "upstream_throttled",
+      livenessReason: "retryable upstream provider throttle",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+    });
+
+    expect(decision).toEqual({
+      kind: "skip",
+      reason: "liveness state is not actionable for continuation",
+    });
+  });
 });

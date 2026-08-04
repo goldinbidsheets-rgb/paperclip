@@ -175,6 +175,7 @@ describe("IssueRunLedger", () => {
       "advanced",
       "plan_only",
       "empty_response",
+      "upstream_throttled",
       "blocked",
       "failed",
       "completed",
@@ -198,6 +199,7 @@ describe("IssueRunLedger", () => {
     expect(container.textContent).toContain("Advanced");
     expect(container.textContent).toContain("Plan only");
     expect(container.textContent).toContain("Empty response");
+    expect(container.textContent).toContain("Upstream throttled");
     expect(container.textContent).toContain("Blocked");
     expect(container.textContent).toContain("Failed");
     expect(container.textContent).toContain("Completed");

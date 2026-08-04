@@ -760,6 +760,50 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
   });
 
+  it("exempts an upstream-throttled leaf only until its retry floor lapses", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date("2026-08-04T16:00:00.000Z");
+    const retryNotBefore = new Date(now.getTime() + 5 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: managerId,
+      status: "succeeded",
+      contextSnapshot: { issueId: blockerIssueId },
+      livenessState: "upstream_throttled",
+      resultJson: {
+        errorFamily: "transient_upstream",
+        retryNotBefore: retryNotBefore.toISOString(),
+      },
+      finishedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const held = await heartbeat.reconcileIssueGraphLiveness({ now });
+
+    expect(held.findings).toBe(1);
+    expect(held.escalationsCreated).toBe(0);
+    expect(held.skipped).toBe(1);
+    const exemptions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.harness_liveness_escalation_exempted"));
+    expect(exemptions).toHaveLength(1);
+    expect(exemptions[0]?.details).toMatchObject({
+      leafIssueId: blockerIssueId,
+      reason: "upstream_throttled backoff window is still pending",
+    });
+
+    const resumed = await heartbeat.reconcileIssueGraphLiveness({
+      now: new Date(retryNotBefore.getTime() + 1),
+    });
+    expect(resumed.findings).toBe(1);
+    expect(resumed.escalationsCreated).toBe(1);
+  });
+
   it("treats open recovery issues as active waiting paths for non-assigned-backlog states", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();

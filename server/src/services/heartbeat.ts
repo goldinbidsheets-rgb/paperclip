@@ -12873,6 +12873,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     resultJson?: Record<string, unknown> | null,
   ) {
     const classification = classifyRunLiveness(await buildRunLivenessInput(run, resultJson));
+    const recoveryResultJson = classification.errorFamily || classification.retryNotBefore
+      ? mergeAdapterRecoveryMetadata({
+          resultJson: resultJson ?? parseObject(run.resultJson),
+          errorFamily: classification.errorFamily,
+          retryNotBefore: classification.retryNotBefore,
+        })
+      : null;
     return db
       .update(heartbeatRuns)
       .set({
@@ -12881,6 +12888,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continuationAttempt: classification.continuationAttempt,
         lastUsefulActionAt: classification.lastUsefulActionAt,
         nextAction: classification.nextAction,
+        ...(recoveryResultJson ? { resultJson: recoveryResultJson } : {}),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id))
@@ -15719,6 +15727,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
+          await scheduleBoundedRetryForRun(livenessRun, agent);
+        } else if (outcome === "succeeded" && livenessRun.livenessState === "upstream_throttled") {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);

@@ -1,4 +1,17 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -53,6 +66,7 @@ import {
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
+import { isUpstreamThrottledBackoffPending } from "../run-liveness.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -4951,6 +4965,55 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
     if (!issue || issue.companyId !== input.finding.companyId) return { kind: "skipped" as const };
     if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+      return { kind: "skipped" as const };
+    }
+
+    const latestLeafRun = await db
+      .select({
+        livenessState: heartbeatRuns.livenessState,
+        resultJson: heartbeatRuns.resultJson,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.finding.companyId),
+          isNotNull(heartbeatRuns.livenessState),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${livenessRecoveryLeafIssueId(input.finding)}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const latestLeafResult = parseObject(latestLeafRun?.resultJson);
+    if (
+      latestLeafRun &&
+      isUpstreamThrottledBackoffPending({
+        livenessState: latestLeafRun.livenessState,
+        retryNotBefore:
+          readNonEmptyString(latestLeafResult.retryNotBefore) ??
+          readNonEmptyString(latestLeafResult.transientRetryNotBefore),
+        finishedAt: latestLeafRun.finishedAt,
+        now: input.now,
+      })
+    ) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.runId ?? null,
+        action: "issue.harness_liveness_escalation_exempted",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          source: "recovery.reconcile_issue_graph_liveness",
+          incidentKey: input.finding.incidentKey,
+          findingState: input.finding.state,
+          leafIssueId: livenessRecoveryLeafIssueId(input.finding),
+          reason: "upstream_throttled backoff window is still pending",
+        },
+      });
       return { kind: "skipped" as const };
     }
 

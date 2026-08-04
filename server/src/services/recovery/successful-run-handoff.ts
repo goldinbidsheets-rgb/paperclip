@@ -490,6 +490,12 @@ export function decideSuccessfulRunHandoff(input: {
   if (input.hasActiveRoutineContinuation) {
     return { kind: "skip", reason: "active routine continuation owns the next action" };
   }
+  if (input.livenessState === "upstream_throttled") {
+    return {
+      kind: "skip",
+      reason: "run hit a retryable upstream throttle; the bounded backoff scheduler owns the retry path",
+    };
+  }
   if (!isProductiveSuccessfulRun(input)) {
     return { kind: "skip", reason: "successful run did not produce handoff-relevant progress" };
   }

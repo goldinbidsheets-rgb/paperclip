@@ -36,6 +36,7 @@ export interface RunLivenessClassificationInput {
   errorCode?: string | null;
   continuationAttempt?: number | null;
   evidence?: Partial<RunLivenessEvidenceInput> | null;
+  now?: Date;
 }
 
 export interface RunLivenessClassification {
@@ -45,6 +46,8 @@ export interface RunLivenessClassification {
   lastUsefulActionAt: Date | null;
   nextAction: string | null;
   actionability: RunLivenessActionability;
+  errorFamily: "transient_upstream" | null;
+  retryNotBefore: string | null;
 }
 
 const DEFAULT_EVIDENCE: RunLivenessEvidenceInput = {
@@ -77,6 +80,150 @@ const PLAN_TASK_DESCRIPTION_RE =
   /\b(?:create|write|produce|draft|update|revise|prepare)\s+(?:a\s+|the\s+)?(?:plan|analysis|investigation|research report|report|proposal|design doc|write-?up)\b/i;
 const UNMANAGED_BACKGROUND_TASK_STOP_REASON = "unmanaged_background_task_stopped";
 const UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON = "unmanaged background task stopped; no durable live path";
+
+export const DEFAULT_UPSTREAM_THROTTLED_RETRY_DELAY_MS = 2 * 60 * 1000;
+export const UPSTREAM_THROTTLED_ESCALATION_GRACE_MS = 30 * 60 * 1000;
+
+const RETRYABLE_UPSTREAM_SIGNATURE_PATTERNS: ReadonlyArray<{ label: string; pattern: RegExp }> = [
+  { label: "RESOURCE_EXHAUSTED", pattern: /\bRESOURCE_EXHAUSTED\b/ },
+  {
+    label: "http_429",
+    pattern: /(?:\b(?:http(?:[\s_-]*status)?|status(?:[\s_-]*code)?|response(?:[\s_-]*status)?|code)\b["']?\s*[:=]?\s*["']?429\b)|\b429\s+(?:too\s+many\s+requests|resource[\s_-]exhausted)\b/i,
+  },
+  { label: "rate_limit", pattern: /\b(?:too many requests|rate[\s_-]?limit(?:ed|ing)?|request limit (?:reached|exceeded))\b/i },
+  {
+    label: "quota",
+    pattern: /\b(?:quota\s+(?:has\s+been\s+)?(?:exceeded|exhausted|depleted)|(?:exceeded|exhausted|depleted)\s+(?:your\s+|the\s+)?quota|insufficient[\s_-]+quota|out\s+of\s+quota|quota\s+limit\s+(?:reached|exceeded))\b/i,
+  },
+  { label: "overloaded", pattern: /\b(?:overloaded(?:_error)?|service\s+overload(?:ed)?)\b/i },
+  {
+    label: "http_5xx",
+    pattern: /(?:\b(?:http(?:[\s_-]*status)?|status(?:[\s_-]*code)?|response(?:[\s_-]*status)?|code)\b["']?\s*[:=]?\s*["']?5\d{2}\b)|\b5\d{2}\s+(?:bad gateway|service unavailable|gateway timeout|internal server error)\b/i,
+  },
+];
+const AI_API_CALL_ERROR_RE = /\bAI_APICallError\b/;
+const AI_API_CALL_NON_RETRYABLE_CONTEXT_RE =
+  /\b(?:400|401|403|unauthorized|forbidden|authentication failed|invalid (?:api[\s_-]?key|request)|permission denied|non[\s_-]?retryable)\b/i;
+const RETRY_DELAY_PATTERNS: ReadonlyArray<RegExp> = [
+  /retry[-_ ]?delay["':\s]{0,4}"?(\d+(?:\.\d+)?)\s*s/i,
+  /retry[-_ ]?after["':\s]{0,4}"?(\d+(?:\.\d+)?)(?:\s*s(?:econds?)?)?\b/i,
+  /try again in\s+(\d+(?:\.\d+)?)\s*s/i,
+];
+const MIN_RETRY_DELAY_MS = 1_000;
+const MAX_RETRY_DELAY_MS = 15 * 60 * 1000;
+const RESULT_JSON_TERMINAL_FIELDS = [
+  "stdout",
+  "stderr",
+  "error",
+  "errorMessage",
+  "rawError",
+  "rawOutput",
+  "providerError",
+  "responseBody",
+] as const;
+
+function readTerminalValue(value: unknown): string | null {
+  const text = readText(value);
+  if (text) return text;
+  if (!value || typeof value !== "object") return null;
+  try {
+    return JSON.stringify(value).slice(0, 20_000);
+  } catch {
+    return null;
+  }
+}
+
+function retryableUpstreamSignatureSources(input: RunLivenessClassificationInput) {
+  const resultJson = input.resultJson ?? null;
+  return [
+    readTerminalValue(input.stderrExcerpt),
+    readTerminalValue(input.stdoutExcerpt),
+    readTerminalValue(input.error),
+    ...RESULT_JSON_TERMINAL_FIELDS.map((field) => readTerminalValue(resultJson?.[field])),
+  ].filter((value): value is string => Boolean(value));
+}
+
+function taskOutputSources(input: RunLivenessClassificationInput) {
+  return [
+    ...(input.issueCommentBodies ?? []).map(readText),
+    readText(input.resultJson?.nextAction),
+    readText(input.resultJson?.summary),
+    readText(input.resultJson?.result),
+    readText(input.resultJson?.message),
+    readText(input.continuationSummaryBody),
+  ].filter((value): value is string => Boolean(value));
+}
+
+export function detectRetryableUpstreamSignature(input: RunLivenessClassificationInput): string | null {
+  const text = retryableUpstreamSignatureSources(input).join("\n");
+  if (!text) return null;
+  for (const candidate of RETRYABLE_UPSTREAM_SIGNATURE_PATTERNS) {
+    if (candidate.pattern.test(text)) return candidate.label;
+  }
+  if (AI_API_CALL_ERROR_RE.test(text) && !AI_API_CALL_NON_RETRYABLE_CONTEXT_RE.test(text)) {
+    return "AI_APICallError";
+  }
+  return null;
+}
+
+export function extractRetryableUpstreamRetryDelayMs(text: string | null | undefined): number | null {
+  if (!text) return null;
+  for (const pattern of RETRY_DELAY_PATTERNS) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    const seconds = Number.parseFloat(match[1] ?? "");
+    if (!Number.isFinite(seconds) || seconds <= 0) continue;
+    return Math.min(MAX_RETRY_DELAY_MS, Math.max(MIN_RETRY_DELAY_MS, Math.round(seconds * 1000)));
+  }
+  return null;
+}
+
+function readFutureRetryNotBefore(value: unknown, now: Date): string | null {
+  if (!(typeof value === "string" || typeof value === "number" || value instanceof Date)) return null;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.getTime() > now.getTime() ? parsed.toISOString() : null;
+}
+
+export function resolveUpstreamThrottledRetryNotBefore(
+  input: RunLivenessClassificationInput,
+  now = input.now ?? new Date(),
+): string {
+  const resultJson = input.resultJson ?? null;
+  for (const value of [
+    resultJson?.retryNotBefore,
+    resultJson?.transientRetryNotBefore,
+    resultJson?.providerQuotaRetryNotBefore,
+  ]) {
+    const existing = readFutureRetryNotBefore(value, now);
+    if (existing) return existing;
+  }
+
+  const rawText = retryableUpstreamSignatureSources(input).join("\n");
+  const retryDelayMs = extractRetryableUpstreamRetryDelayMs(rawText) ?? DEFAULT_UPSTREAM_THROTTLED_RETRY_DELAY_MS;
+  return new Date(now.getTime() + retryDelayMs).toISOString();
+}
+
+export function isUpstreamThrottledBackoffPending(input: {
+  livenessState: string | null | undefined;
+  retryNotBefore?: string | number | Date | null;
+  finishedAt?: string | number | Date | null;
+  now?: Date;
+  graceMs?: number;
+}): boolean {
+  if (input.livenessState !== "upstream_throttled") return false;
+  const now = input.now ?? new Date();
+  if (input.retryNotBefore != null) {
+    const retryNotBefore = new Date(input.retryNotBefore);
+    if (!Number.isNaN(retryNotBefore.getTime())) return retryNotBefore.getTime() > now.getTime();
+  }
+
+  if (input.finishedAt != null) {
+    const finishedAt = new Date(input.finishedAt);
+    const graceMs = input.graceMs ?? UPSTREAM_THROTTLED_ESCALATION_GRACE_MS;
+    if (!Number.isNaN(finishedAt.getTime()) && now.getTime() - finishedAt.getTime() < graceMs) return true;
+  }
+  return false;
+}
 
 function compactReason(reason: string) {
   return reason.length <= 500 ? reason : `${reason.slice(0, 497)}...`;
@@ -313,13 +460,20 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
   const planExempt = isPlanningOrDocumentTask(input.issue) || evidence.planDocumentRevisionsCreated > 0;
   const lastUsefulActionAt = concreteEvidence ? evidence.latestEvidenceAt : null;
 
-  const output = (state: RunLivenessState, reason: string, nextAction: string | null = null): RunLivenessClassification => ({
+  const output = (
+    state: RunLivenessState,
+    reason: string,
+    nextAction: string | null = null,
+    recovery?: { errorFamily: "transient_upstream"; retryNotBefore: string },
+  ): RunLivenessClassification => ({
     livenessState: state,
     livenessReason: compactReason(reason),
     continuationAttempt,
     lastUsefulActionAt: state === "advanced" || state === "completed" || state === "blocked" ? lastUsefulActionAt : null,
     nextAction,
     actionability,
+    errorFamily: recovery?.errorFamily ?? null,
+    retryNotBefore: recovery?.retryNotBefore ?? null,
   });
 
   if (input.runStatus === "interrupted") {
@@ -339,6 +493,21 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
 
   if (declaredBlocker(input)) {
     return output("blocked", issueStatus === "blocked" ? "Issue status is blocked" : "Run output declared a concrete blocker", nextAction);
+  }
+
+  const upstreamSignature = !concreteEvidence && taskOutputSources(input).length === 0
+    ? detectRetryableUpstreamSignature(input)
+    : null;
+  if (upstreamSignature) {
+    return output(
+      "upstream_throttled",
+      `Run succeeded without task output but its terminal output carries a retryable-upstream signature (${upstreamSignature}); deferring to bounded backoff`,
+      null,
+      {
+        errorFamily: "transient_upstream",
+        retryNotBefore: resolveUpstreamThrottledRetryNotBefore(input),
+      },
+    );
   }
 
   if (!usefulOutput && !concreteEvidence) {

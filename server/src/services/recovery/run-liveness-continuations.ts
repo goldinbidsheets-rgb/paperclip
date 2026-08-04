@@ -8,6 +8,8 @@ import { RECOVERY_REASON_KINDS } from "./origins.js";
 export const RUN_LIVENESS_CONTINUATION_REASON = RECOVERY_REASON_KINDS.runLivenessContinuation;
 export const DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS = 2;
 
+// `upstream_throttled` is intentionally absent: the existing bounded retry
+// scheduler owns provider-throttle recovery, not an immediate continuation.
 const ACTIONABLE_LIVENESS_STATES = new Set<RunLivenessState>(["plan_only", "empty_response"]);
 const CONTINUATION_ACTIVE_ISSUE_STATUSES = new Set(["todo", "in_progress"]);
 // A prior adapter error should not permanently suppress bounded liveness

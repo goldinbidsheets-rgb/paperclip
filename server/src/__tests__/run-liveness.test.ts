@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { classifyRunLiveness } from "../services/run-liveness.ts";
+import {
+  DEFAULT_UPSTREAM_THROTTLED_RETRY_DELAY_MS,
+  classifyRunLiveness,
+  extractRetryableUpstreamRetryDelayMs,
+  isUpstreamThrottledBackoffPending,
+} from "../services/run-liveness.ts";
 
 const baseInput = {
   runStatus: "succeeded",
@@ -227,5 +232,139 @@ describe("run liveness classifier", () => {
     expect(classification.livenessState).toBe("needs_followup");
     expect(classification.actionability).toBe("unknown");
     expect(classification.nextAction).toBeNull();
+  });
+});
+
+describe("upstream throttled liveness", () => {
+  const now = new Date("2026-08-04T12:00:00.000Z");
+
+  it("classifies a succeeded terminal 429 as transient upstream with a retry floor", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      stderrExcerpt: "429 RESOURCE_EXHAUSTED",
+      now,
+    });
+
+    expect(classification.livenessState).toBe("upstream_throttled");
+    expect(classification.errorFamily).toBe("transient_upstream");
+    expect(classification.retryNotBefore).toBe(
+      new Date(now.getTime() + DEFAULT_UPSTREAM_THROTTLED_RETRY_DELAY_MS).toISOString(),
+    );
+  });
+
+  it("reuses a valid structured retry floor", () => {
+    const retryNotBefore = "2026-08-04T12:09:00.000Z";
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      resultJson: { retryNotBefore },
+      stderrExcerpt: "status: 429 too many requests",
+      now,
+    });
+
+    expect(classification.livenessState).toBe("upstream_throttled");
+    expect(classification.retryNotBefore).toBe(retryNotBefore);
+  });
+
+  it("recognizes retryable AI_APICallError and 5xx terminal signatures", () => {
+    for (const stderrExcerpt of [
+      "AI_APICallError",
+      "AI_APICallError: provider temporarily unavailable; try again",
+      "HTTP status 503 Service Unavailable",
+      "response status: 529",
+    ]) {
+      expect(classifyRunLiveness({ ...baseInput, stderrExcerpt, now }).livenessState).toBe(
+        "upstream_throttled",
+      );
+    }
+  });
+
+  it("recognizes JSON-shaped retryable status errors", () => {
+    expect(
+      classifyRunLiveness({
+        ...baseInput,
+        resultJson: { error: { statusCode: 429, message: "Too many requests" } },
+        now,
+      }).livenessState,
+    ).toBe("upstream_throttled");
+    expect(
+      classifyRunLiveness({
+        ...baseInput,
+        resultJson: { providerError: { responseStatus: 503 } },
+        now,
+      }).livenessState,
+    ).toBe("upstream_throttled");
+  });
+
+  it("does not classify auth errors, benign numeric prose, or task-authored prose as throttles", () => {
+    expect(
+      classifyRunLiveness({
+        ...baseInput,
+        stderrExcerpt: "AI_APICallError: 401 Unauthorized; invalid API key",
+        now,
+      }).livenessState,
+    ).toBe("needs_followup");
+    expect(
+      classifyRunLiveness({
+        ...baseInput,
+        stderrExcerpt: "status: processed 429 rows from the export",
+        now,
+      }).livenessState,
+    ).toBe("empty_response");
+    expect(
+      classifyRunLiveness({
+        ...baseInput,
+        resultJson: { summary: "Documented HTTP status 503 as an example for the runbook." },
+        now,
+      }).livenessState,
+    ).toBe("needs_followup");
+  });
+
+  it("preserves terminal issue, blocker, and useful-output decisions", () => {
+    expect(
+      classifyRunLiveness({
+        ...baseInput,
+        issue: { ...baseInput.issue, status: "done" },
+        stderrExcerpt: "status: 429",
+        now,
+      }).livenessState,
+    ).toBe("completed");
+    expect(
+      classifyRunLiveness({
+        ...baseInput,
+        issue: { ...baseInput.issue, status: "blocked" },
+        stderrExcerpt: "status: 429",
+        now,
+      }).livenessState,
+    ).toBe("blocked");
+    expect(
+      classifyRunLiveness({
+        ...baseInput,
+        resultJson: { summary: "Implemented and verified the requested change." },
+        stderrExcerpt: "status: 429",
+        now,
+      }).livenessState,
+    ).toBe("needs_followup");
+  });
+
+  it("parses provider retry delays and bounds the alarm exemption to the retry window", () => {
+    expect(extractRetryableUpstreamRetryDelayMs('"retryDelay": "27s"')).toBe(27_000);
+    expect(extractRetryableUpstreamRetryDelayMs("Retry-After: 60")).toBe(60_000);
+    expect(extractRetryableUpstreamRetryDelayMs("Please try again in 1.5s.")).toBe(1_500);
+
+    expect(
+      isUpstreamThrottledBackoffPending({
+        livenessState: "upstream_throttled",
+        retryNotBefore: "2026-08-04T12:01:00.000Z",
+        now,
+      }),
+    ).toBe(true);
+    expect(
+      isUpstreamThrottledBackoffPending({
+        livenessState: "upstream_throttled",
+        retryNotBefore: "2026-08-04T11:59:00.000Z",
+        finishedAt: "2026-08-04T11:59:30.000Z",
+        now,
+      }),
+    ).toBe(false);
   });
 });

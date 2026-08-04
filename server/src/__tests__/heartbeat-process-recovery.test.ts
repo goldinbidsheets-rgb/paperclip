@@ -666,7 +666,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runSource?: string | null;
     assignToUser?: boolean;
     activePauseHold?: boolean;
-    livenessState?: "completed" | "advanced" | "plan_only" | "empty_response" | "blocked" | "failed" | "needs_followup" | null;
+    livenessState?:
+      | "completed"
+      | "advanced"
+      | "plan_only"
+      | "empty_response"
+      | "upstream_throttled"
+      | "blocked"
+      | "failed"
+      | "needs_followup"
+      | null;
     runErrorCode?: string | null;
     runError?: string | null;
     resultJson?: Record<string, unknown> | null;
@@ -2668,6 +2677,73 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("classifies a succeeded raw provider throttle and schedules the existing bounded retry", async () => {
+    mockAdapterExecute.mockImplementationOnce(async (rawInput?: unknown) => {
+      const input = rawInput as {
+        onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+      };
+      await input.onLog?.(
+        "stderr",
+        'status: 429\npayload: {"status":"RESOURCE_EXHAUSTED","retryDelay":"600s"}\n',
+      );
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const runs = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return rows.length >= 2 ? rows : null;
+    });
+    expect(runs).toHaveLength(2);
+
+    const sourceRun = runs?.find((row) => row.id === runId);
+    const retryRun = runs?.find((row) => row.id !== runId);
+    const sourceResult = sourceRun?.resultJson as Record<string, unknown> | null;
+    const retryNotBefore = new Date(String(sourceResult?.retryNotBefore));
+
+    expect(sourceRun?.status).toBe("succeeded");
+    expect(sourceRun?.livenessState).toBe("upstream_throttled");
+    expect(sourceResult).toMatchObject({ errorFamily: "transient_upstream" });
+    expect(Number.isNaN(retryNotBefore.getTime())).toBe(false);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryReason).toBe("transient_failure");
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBeGreaterThanOrEqual(retryNotBefore.getTime());
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      errorFamily: "transient_upstream",
+      transientRetryNotBefore: retryNotBefore.toISOString(),
+    });
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups.some((row) => row.reason === "run_liveness_continuation")).toBe(false);
+    expect(wakeups.some((row) => row.reason === "finish_successful_run_handoff")).toBe(false);
   });
 
   it("schedules bounded retries for failed accepted interaction continuation wakes", async () => {
