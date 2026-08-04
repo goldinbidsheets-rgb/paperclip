@@ -1651,7 +1651,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const routineId = randomUUID();
     const siblingIssueId = randomUUID();
     const peerBlockedIssueId = randomUUID();
-    const peerActiveIssueId = randomUUID();
+    const concurrentActiveIssueId = randomUUID();
+    const concurrentRunId = randomUUID();
+    await seedHeartbeatRun({
+      companyId,
+      agentId: coderId,
+      runId: concurrentRunId,
+      issueId: concurrentActiveIssueId,
+    });
     await db
       .update(issues)
       .set({ originKind: "routine_execution", originId: routineId })
@@ -1682,12 +1689,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         originId: routineId,
       },
       {
-        id: peerActiveIssueId,
+        id: concurrentActiveIssueId,
         companyId,
-        title: "Peer-owned active routine fire",
+        title: "Concurrent active routine fire",
         status: "in_progress",
         priority: "medium",
-        assigneeAgentId: managerId,
+        assigneeAgentId: coderId,
+        checkoutRunId: concurrentRunId,
         issueNumber: 4,
         identifier: `${prefix}-4`,
         originKind: "routine_execution",
@@ -1743,11 +1751,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     const peerBlocked = await patchAsRun(peerBlockedIssueId).send({ status: "done" });
     expect(peerBlocked.status).toBe(403);
-    expect(peerBlocked.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(peerBlocked.body.error).toBe("Issue is outside this actor's authorization boundary");
 
-    const peerActive = await patchAsRun(peerActiveIssueId).send({ status: "done" });
-    expect(peerActive.status).toBe(409);
-    expect(peerActive.body.error).toBe("Issue is checked out by another agent");
+    const concurrentActive = await patchAsRun(concurrentActiveIssueId).send({ status: "done" });
+    expect(concurrentActive.status).toBe(409);
+    expect(concurrentActive.body.error).toBe("Issue run ownership conflict");
 
     const closed = await patchAsRun(siblingIssueId).send({ status: "done" });
     expect(closed.status, JSON.stringify(closed.body)).toBe(200);
@@ -1760,7 +1768,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       await db.select({ status: issues.status }).from(issues).where(eq(issues.id, peerBlockedIssueId)),
     ).toEqual([{ status: "blocked" }]);
     expect(
-      await db.select({ status: issues.status }).from(issues).where(eq(issues.id, peerActiveIssueId)),
+      await db.select({ status: issues.status }).from(issues).where(eq(issues.id, concurrentActiveIssueId)),
     ).toEqual([{ status: "in_progress" }]);
     expect(
       await db.select().from(issueComments).where(eq(issueComments.issueId, siblingIssueId)),
