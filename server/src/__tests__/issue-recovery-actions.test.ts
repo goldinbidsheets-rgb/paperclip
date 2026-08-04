@@ -7,7 +7,9 @@ import {
   agents,
   agentWakeupRequests,
   activityLog,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   environmentLeases,
   environments,
@@ -147,8 +149,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(environments);
     await db.delete(issueInboxArchives);
     await db.delete(issues);
+    await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -1628,6 +1632,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   it("lets a run-scoped agent JWT close its blocked routine sibling without fighting peer-owned siblings", async () => {
     const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: "local-board",
+      name: "Board",
+      email: "local@paperclip.local",
+      emailVerified: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "local-board",
+      status: "active",
+      membershipRole: "owner",
+    });
     const routineId = randomUUID();
     const siblingIssueId = randomUUID();
     const peerBlockedIssueId = randomUUID();
