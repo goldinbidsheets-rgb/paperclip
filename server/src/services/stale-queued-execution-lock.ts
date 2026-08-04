@@ -5,7 +5,9 @@ import type {
 } from "@paperclipai/db";
 
 // Queued retries can legitimately wait behind long agent runs. Require a
-// materially overdue hour in addition to the no-active-run classifier gate.
+// materially overdue hour after both eligibility and the latest observed
+// started sibling's completion (a capacity release), in addition to the
+// no-active-run classifier gate.
 export const STALE_QUEUED_EXECUTION_LOCK_GRACE_MS = 60 * 60 * 1000;
 export const STALE_QUEUED_EXECUTION_LOCK_ERROR_CODE = "stale_queued_execution_lock";
 
@@ -51,6 +53,8 @@ export type StaleQueuedExecutionLockClassification =
   | {
       stale: true;
       eligibilityAt: Date;
+      graceAnchorAt: Date;
+      agentLatestFinishedRunAt: Date | null;
       staleAt: Date;
       graceMs: number;
     };
@@ -85,9 +89,17 @@ export function classifyStaleQueuedExecutionLock(input: {
   run: QueuedRun;
   wakeup: QueuedWakeup | null;
   agentHasRunningRun: boolean;
+  agentLatestFinishedRunAt: Date | null;
   now: Date;
 }): StaleQueuedExecutionLockClassification {
-  const { issue, run, wakeup, agentHasRunningRun, now } = input;
+  const {
+    issue,
+    run,
+    wakeup,
+    agentHasRunningRun,
+    agentLatestFinishedRunAt,
+    now,
+  } = input;
 
   if (issue.executionRunId !== run.id || run.status !== "queued") {
     return { stale: false };
@@ -109,12 +121,18 @@ export function classifyStaleQueuedExecutionLock(input: {
   const eligibilityAt = run.scheduledRetryAt ?? run.createdAt;
   const eligibilityMs = eligibilityAt.getTime();
   if (!Number.isFinite(eligibilityMs)) return { stale: false };
-  const staleAt = new Date(eligibilityMs + STALE_QUEUED_EXECUTION_LOCK_GRACE_MS);
+  const latestFinishedMs = agentLatestFinishedRunAt?.getTime() ?? Number.NEGATIVE_INFINITY;
+  const graceAnchorAt = Number.isFinite(latestFinishedMs) && latestFinishedMs > eligibilityMs
+    ? agentLatestFinishedRunAt!
+    : eligibilityAt;
+  const staleAt = new Date(graceAnchorAt.getTime() + STALE_QUEUED_EXECUTION_LOCK_GRACE_MS);
   if (now.getTime() < staleAt.getTime()) return { stale: false };
 
   return {
     stale: true,
     eligibilityAt,
+    graceAnchorAt,
+    agentLatestFinishedRunAt,
     staleAt,
     graceMs: STALE_QUEUED_EXECUTION_LOCK_GRACE_MS,
   };

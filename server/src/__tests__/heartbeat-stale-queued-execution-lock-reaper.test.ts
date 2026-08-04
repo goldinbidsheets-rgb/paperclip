@@ -333,6 +333,60 @@ describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
     expect(wakeup?.status).toBe("completed");
   });
 
+  it("preserves an overdue retry for a bounded grace after a higher-priority sibling finishes", async () => {
+    const seeded = await seedLockedQueuedRun();
+    const higherPriorityIssueId = randomUUID();
+    const higherPriorityRunId = randomUUID();
+    const higherPriorityFinishedAt = new Date("2026-07-29T11:59:30.000Z");
+    await db
+      .update(issues)
+      .set({ priority: "low" })
+      .where(eq(issues.id, seeded.issueId));
+    await db.insert(issues).values({
+      id: higherPriorityIssueId,
+      companyId: seeded.companyId,
+      title: "Higher-priority queued work",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: seeded.agentId,
+      createdAt: new Date("2026-07-29T11:58:00.000Z"),
+      updatedAt: higherPriorityFinishedAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: higherPriorityRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      startedAt: new Date("2026-07-29T11:59:00.000Z"),
+      finishedAt: higherPriorityFinishedAt,
+      contextSnapshot: { issueId: higherPriorityIssueId },
+      createdAt: new Date("2026-07-29T11:58:00.000Z"),
+      updatedAt: higherPriorityFinishedAt,
+    });
+
+    const duringCapacityTransition = await heartbeat.reapStaleQueuedExecutionLocks({ now });
+
+    expect(duringCapacityTransition).toEqual({ reaped: 0, runIds: [], issueIds: [] });
+    const preservedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.runId))
+      .then((rows) => rows[0]);
+    expect(preservedRun?.status).toBe("queued");
+
+    const afterCapacityGrace = await heartbeat.reapStaleQueuedExecutionLocks({
+      now: new Date("2026-07-29T13:00:00.000Z"),
+    });
+
+    expect(afterCapacityGrace).toEqual({
+      reaped: 1,
+      runIds: [seeded.runId],
+      issueIds: [seeded.issueId],
+    });
+  }, 20_000);
+
   it("is a no-op when a claim wins after stale-candidate discovery", async () => {
     const seeded = await seedLockedQueuedRun();
     const lockReady = deferred();

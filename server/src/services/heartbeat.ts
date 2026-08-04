@@ -12882,20 +12882,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null);
       if (!lockedIssue) return null;
 
-      const runningRun = await tx
-        .select({ id: heartbeatRuns.id })
+      const agentCapacity = await tx
+        .select({
+          hasRunningRun: sql<boolean>`coalesce(bool_or(${heartbeatRuns.status} = 'running'), false)`,
+          latestFinishedRunAt: sql`max(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null)`
+            .mapWith(heartbeatRuns.finishedAt),
+        })
         .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.agentId, lockedRun.agentId),
-          eq(heartbeatRuns.status, "running"),
-        ))
-        .limit(1)
+        .where(eq(heartbeatRuns.agentId, lockedRun.agentId))
         .then((rows) => rows[0] ?? null);
       const classification = classifyStaleQueuedExecutionLock({
         issue: lockedIssue,
         run: lockedRun,
         wakeup: lockedWakeup,
-        agentHasRunningRun: Boolean(runningRun),
+        agentHasRunningRun: agentCapacity?.hasRunningRun ?? false,
+        agentLatestFinishedRunAt: agentCapacity?.latestFinishedRunAt ?? null,
         now: input.now,
       });
       if (!classification.stale) return null;
@@ -12976,6 +12977,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         runId: lockedRun.id,
         wakeupRequestId: lockedWakeup.id,
         eligibilityAt: classification.eligibilityAt.toISOString(),
+        graceAnchorAt: classification.graceAnchorAt.toISOString(),
+        agentLatestFinishedRunAt: classification.agentLatestFinishedRunAt?.toISOString() ?? null,
         staleAt: classification.staleAt.toISOString(),
         graceMs: classification.graceMs,
       };
@@ -13055,25 +13058,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ));
 
     const candidateAgentIds = [...new Set(candidates.map((candidate) => candidate.run.agentId))];
-    const runningAgentRows = candidateAgentIds.length > 0
+    const agentCapacityRows = candidateAgentIds.length > 0
       ? await db
-          .select({ agentId: heartbeatRuns.agentId })
+          .select({
+            agentId: heartbeatRuns.agentId,
+            hasRunningRun: sql<boolean>`coalesce(bool_or(${heartbeatRuns.status} = 'running'), false)`,
+            latestFinishedRunAt: sql`max(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null)`
+              .mapWith(heartbeatRuns.finishedAt),
+          })
           .from(heartbeatRuns)
-          .where(and(
-            inArray(heartbeatRuns.agentId, candidateAgentIds),
-            eq(heartbeatRuns.status, "running"),
-          ))
+          .where(inArray(heartbeatRuns.agentId, candidateAgentIds))
+          .groupBy(heartbeatRuns.agentId)
       : [];
-    const agentsWithRunningRuns = new Set(runningAgentRows.map((row) => row.agentId));
+    const agentCapacityById = new Map(agentCapacityRows.map((row) => [row.agentId, row]));
     const reapedRunIds: string[] = [];
     const reapedIssueIds: string[] = [];
     const visitedRunIds = new Set<string>();
     for (const candidate of candidates) {
       if (visitedRunIds.has(candidate.run.id)) continue;
       visitedRunIds.add(candidate.run.id);
+      const agentCapacity = agentCapacityById.get(candidate.run.agentId);
       const preliminary = classifyStaleQueuedExecutionLock({
         ...candidate,
-        agentHasRunningRun: agentsWithRunningRuns.has(candidate.run.agentId),
+        agentHasRunningRun: agentCapacity?.hasRunningRun ?? false,
+        agentLatestFinishedRunAt: agentCapacity?.latestFinishedRunAt ?? null,
         now,
       });
       if (!preliminary.stale) continue;
