@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, integer, timestamp, boolean, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { check, pgTable, uuid, text, integer, timestamp, boolean, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
   "companies",
@@ -16,6 +17,7 @@ export const companies = pgTable(
     attachmentMaxBytes: integer("attachment_max_bytes")
       .notNull()
       .default(10 * 1024 * 1024),
+    maxConcurrentHeartbeatRuns: integer("max_concurrent_heartbeat_runs"),
     defaultResponsibleUserId: text("default_responsible_user_id"),
     requireBoardApprovalForNewAgents: boolean("require_board_approval_for_new_agents")
       .notNull()
@@ -32,5 +34,9 @@ export const companies = pgTable(
   },
   (table) => ({
     issuePrefixUniqueIdx: uniqueIndex("companies_issue_prefix_idx").on(table.issuePrefix),
+    maxConcurrentHeartbeatRunsPositive: check(
+      "companies_max_concurrent_heartbeat_runs_positive",
+      sql`${table.maxConcurrentHeartbeatRuns} is null or ${table.maxConcurrentHeartbeatRuns} > 0`,
+    ),
   }),
 );

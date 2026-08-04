@@ -1026,11 +1026,13 @@ Failed source-work retries, process-loss retries, transient/scheduled retries, m
 
 ## 11.6 Scheduler Rules
 
-Per-agent schedule fields in `adapter_config`:
+Per-agent schedule fields in `runtime_config.heartbeat`:
 
 - `enabled` boolean
 - `intervalSec` integer (minimum 30)
 - `maxConcurrentRuns` integer; new agents default to `20`; scheduler clamps configured values to `1..50`
+
+Companies may also set `maxConcurrentHeartbeatRuns` to a positive integer (`null` means no company aggregate cap). Every queued-to-running promotion must enforce both the per-agent and company limits through a company-scoped database serialization point. Capacity overflow stays queued and is reconsidered across all company agents whenever a running slot is released.
 
 Scheduler must skip invocation when:
 

@@ -12,12 +12,14 @@ const attachmentMaxBytesSchema = z
   .int()
   .min(1)
   .max(MAX_COMPANY_ATTACHMENT_MAX_BYTES);
+const maxConcurrentHeartbeatRunsSchema = z.number().int().positive().nullable();
 
 export const createCompanySchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   attachmentMaxBytes: attachmentMaxBytesSchema.optional(),
+  maxConcurrentHeartbeatRuns: maxConcurrentHeartbeatRunsSchema.optional(),
   defaultResponsibleUserId: z.string().min(1).nullable().optional(),
 });
 

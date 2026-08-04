@@ -12,6 +12,7 @@ export interface Company {
   budgetMonthlyCents: number;
   spentMonthlyCents: number;
   attachmentMaxBytes: number;
+  maxConcurrentHeartbeatRuns: number | null;
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
   feedbackDataSharingEnabled: boolean;

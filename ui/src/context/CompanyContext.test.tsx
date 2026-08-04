@@ -39,6 +39,7 @@ function makeCompany(id: string): Company {
     budgetMonthlyCents: 0,
     spentMonthlyCents: 0,
     attachmentMaxBytes: 10 * 1024 * 1024,
+    maxConcurrentHeartbeatRuns: null,
     defaultResponsibleUserId: null,
     requireBoardApprovalForNewAgents: false,
     feedbackDataSharingEnabled: false,
