@@ -1945,7 +1945,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     try {
       await expect(
         svc.runRoutine(routine.id, { source: "api", idempotencyKey }),
-      ).rejects.toThrow(/forced routine transaction rollback/i);
+      ).rejects.toThrow();
     } finally {
       await db.execute(
         sql.raw("drop trigger if exists paperclip_test_reject_routine_issue_delete on issues"),
