@@ -158,6 +158,11 @@ import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./exec
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
+  probeWindowsProcessTreeLiveness,
+  type WindowsProcessTreeEvidence,
+  type WindowsProcessTreeProbe,
+} from "./windows-process-tree.js";
+import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
   cleanupHeartbeatRunScratch,
@@ -5145,6 +5150,43 @@ function mergeHotRestartAdoptionResultJson(
   };
 }
 
+function mergeWindowsProcessTreeEvidenceResultJson(
+  resultJson: Record<string, unknown> | null | undefined,
+  evidence: WindowsProcessTreeEvidence,
+) {
+  return {
+    ...parseObject(resultJson),
+    windowsProcessTree: {
+      version: 1,
+      evidenceKind: "parent_pid_and_creation_window",
+      rootPid: evidence.rootPid,
+      rootStartedAt: evidence.rootStartedAt,
+      observedAt: evidence.observedAt,
+      descendantPids: evidence.descendants.map((entry) => entry.pid),
+      agentDescendants: evidence.agentDescendants.map((entry) => ({
+        pid: entry.pid,
+        parentPid: entry.parentPid,
+        startedAt: entry.startedAt,
+        name: entry.name,
+      })),
+    },
+  };
+}
+
+function hasMatchingWindowsProcessTreeEvidence(
+  resultJson: Record<string, unknown> | null | undefined,
+  evidence: WindowsProcessTreeEvidence,
+) {
+  const existing = parseObject(parseObject(resultJson).windowsProcessTree);
+  const descendantPids = Array.isArray(existing.descendantPids)
+    ? existing.descendantPids.filter((value): value is number => typeof value === "number")
+    : [];
+  const nextPids = evidence.descendants.map((entry) => entry.pid);
+  return existing.rootPid === evidence.rootPid &&
+    descendantPids.length === nextPids.length &&
+    descendantPids.every((pid, index) => pid === nextPids[index]);
+}
+
 function truncateDisplayId(value: string | null | undefined, max = 128) {
   if (!value) return null;
   return value.length > max ? value.slice(0, max) : value;
@@ -5382,6 +5424,7 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  windowsProcessTreeProbe?: WindowsProcessTreeProbe;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -5410,6 +5453,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
   const runtimeEnv = options.runtimeEnv ?? process.env;
+  const windowsProcessTreeProbe = options.windowsProcessTreeProbe ?? probeWindowsProcessTreeLiveness;
   const inWorktreeRuntime = isTruthyRuntimeEnvValue(runtimeEnv.PAPERCLIP_IN_WORKTREE);
   // Preview worktree instances suppress the run engine by default. Users can lift
   // that per-worktree via the `enableWorktreeRunExecution` experimental setting
@@ -8815,6 +8859,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
+
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -11419,6 +11464,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
 
+    let windowsProcessTreeEvidenceByRunId = new Map<string, WindowsProcessTreeEvidence>();
+    if (options.windowsProcessTreeProbe || process.platform === "win32") {
+      const windowsProcessTreeRoots = activeRuns.flatMap(({ run, adapterType }) => {
+        if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) return [];
+        if (staleThresholdMs > 0 && now.getTime() - run.updatedAt.getTime() < staleThresholdMs) return [];
+        if (!isTrackedLocalChildProcessAdapter(adapterType)) return [];
+        if (!run.processPid || run.processGroupId || !run.processStartedAt) return [];
+        if (isProcessAlive(run.processPid)) return [];
+        return [{
+          runId: run.id,
+          pid: run.processPid,
+          startedAt: new Date(run.processStartedAt),
+        }];
+      });
+      if (windowsProcessTreeRoots.length > 0) {
+        try {
+          windowsProcessTreeEvidenceByRunId = await windowsProcessTreeProbe(windowsProcessTreeRoots);
+        } catch (err) {
+          logger.warn(
+            { err, runIds: windowsProcessTreeRoots.map((root) => root.runId) },
+            "failed to inspect Windows descendant process trees during orphan reap",
+          );
+        }
+      }
+    }
+
     const monitorIssueIds = [...new Set(activeRuns.flatMap(({ run }) => {
       const runContext = parseObject(run.contextSnapshot);
       if (readNonEmptyString(runContext.wakeReason) !== "issue_monitor_due") return [];
@@ -11460,6 +11531,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (processPidAlive || processGroupAlive) &&
         readHotRestartAdoptionMetadata(parseObject(run.resultJson))
       ) {
+        continue;
+      }
+      const windowsProcessTreeEvidence = windowsProcessTreeEvidenceByRunId.get(run.id) ?? null;
+      if (windowsProcessTreeEvidence) {
+        if (
+          run.errorCode === DETACHED_PROCESS_ERROR_CODE &&
+          hasMatchingWindowsProcessTreeEvidence(parseObject(run.resultJson), windowsProcessTreeEvidence)
+        ) {
+          continue;
+        }
+        const agentDescendantPids = windowsProcessTreeEvidence.agentDescendants
+          .map((entry) => entry.pid)
+          .join(", ");
+        const detachedMessage =
+          `Lost Windows wrapper pid ${run.processPid}, but verified descendant process(es) ${agentDescendantPids} are still alive`;
+        const detachedRun = await setRunStatus(run.id, "running", {
+          error: detachedMessage,
+          errorCode: DETACHED_PROCESS_ERROR_CODE,
+          resultJson: mergeWindowsProcessTreeEvidenceResultJson(
+            parseObject(run.resultJson),
+            windowsProcessTreeEvidence,
+          ),
+        });
+        if (detachedRun) {
+          await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: detachedMessage,
+            payload: {
+              processPid: run.processPid,
+              evidenceKind: "parent_pid_and_creation_window",
+              observedAt: windowsProcessTreeEvidence.observedAt,
+              descendants: windowsProcessTreeEvidence.agentDescendants.map((entry) => ({
+                pid: entry.pid,
+                parentPid: entry.parentPid,
+                startedAt: entry.startedAt,
+                name: entry.name,
+              })),
+            },
+          });
+        }
         continue;
       }
       if (processPidAlive) {

@@ -540,6 +540,8 @@ On startup and on the periodic recovery loop, Paperclip now does five things in 
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output. The productivity-review pass is later and separate; it reviews unusual progression patterns on assigned source issues, not stale run handles after a source issue already has a valid disposition.
 
+On Windows, a local CLI command may resolve through a `.cmd`/`.bat` or pipeline wrapper. The recorded wrapper PID can exit during a server restart while the actual agent process remains alive. Startup orphan reconciliation therefore applies a bounded Windows process-tree census before declaring `process_lost`: it requires a live non-wrapper descendant whose `ParentProcessId` chain reaches the recorded wrapper PID and whose creation time falls within the persisted launch window. Positive evidence keeps the existing run and issue execution lock intact as `process_detached` and records only PID, parent PID, process name, and creation time for audit. Missing process start metadata, a failed/empty census, wrapper-only descendants, or descendants created outside the launch window do not authorize continuity and fall through to the existing bounded `process_lost` recovery. API activity by itself is never descendant evidence.
+
 ## 11. Task Watchdog for Issue Trees
 
 A task watchdog watches a configured issue subtree after that subtree has stopped moving. It is a product-level verification and recovery mechanism for selected work, not a process monitor.

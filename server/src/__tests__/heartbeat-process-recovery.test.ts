@@ -459,10 +459,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   async function seedRunFixture(input?: {
     adapterType?: string;
+    adapterConfig?: Record<string, unknown>;
     agentStatus?: "paused" | "idle" | "running";
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
+    processStartedAt?: Date | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
@@ -492,7 +494,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       role: "engineer",
       status: input?.agentStatus ?? "paused",
       adapterType: input?.adapterType ?? "codex_local",
-      adapterConfig: {},
+      adapterConfig: input?.adapterConfig ?? {},
       runtimeConfig: {},
       permissions: {},
     });
@@ -523,6 +525,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         : { ...(input?.contextSnapshot ?? {}), issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
+      processStartedAt: input?.processStartedAt ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
@@ -1208,6 +1211,96 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("keeps a tracked Windows wrapper run active across startup when a verified agent descendant is alive", async () => {
+    const processStartedAt = new Date("2026-08-05T11:59:21.000Z");
+    const processPid = 999_999_998;
+    const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
+      adapterType: "claude_local",
+      adapterConfig: { command: "claude-overflow.cmd" },
+      agentStatus: "running",
+      processPid,
+      processGroupId: null,
+      processStartedAt,
+    });
+    const windowsProcessTreeProbe = vi.fn(async () => new Map([
+      [runId, {
+        rootPid: processPid,
+        rootStartedAt: processStartedAt.toISOString(),
+        observedAt: "2026-08-05T12:02:05.000Z",
+        descendants: [{
+          pid: 24001,
+          parentPid: processPid,
+          startedAt: "2026-08-05T11:59:22.000Z",
+          name: "node.exe",
+        }],
+        agentDescendants: [{
+          pid: 24001,
+          parentPid: processPid,
+          startedAt: "2026-08-05T11:59:22.000Z",
+          name: "node.exe",
+        }],
+      }],
+    ]));
+    const heartbeat = heartbeatService(db, { windowsProcessTreeProbe });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect(windowsProcessTreeProbe).toHaveBeenCalledWith([
+      { runId, pid: processPid, startedAt: processStartedAt },
+    ]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run).toMatchObject({
+      status: "running",
+      errorCode: "process_detached",
+    });
+    expect(run?.error).toContain("verified descendant process(es) 24001");
+    expect(run?.resultJson).toMatchObject({
+      windowsProcessTree: {
+        version: 1,
+        evidenceKind: "parent_pid_and_creation_window",
+        rootPid: processPid,
+        descendantPids: [24001],
+        agentDescendants: [{ pid: 24001, name: "node.exe" }],
+      },
+    });
+
+    const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(allRuns).toHaveLength(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(issue).toMatchObject({ checkoutRunId: runId, executionRunId: runId });
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0]);
+    expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("preserves process_lost recovery when the Windows wrapper tree is genuinely dead", async () => {
+    const processStartedAt = new Date("2026-08-05T11:59:21.000Z");
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      adapterConfig: { command: "claude-overflow.cmd" },
+      agentStatus: "idle",
+      processPid: 999_999_997,
+      processGroupId: null,
+      processStartedAt,
+    });
+    const windowsProcessTreeProbe = vi.fn(async () => new Map());
+    const heartbeat = heartbeatService(db, { windowsProcessTreeProbe });
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 1, runIds: [runId] });
+    const failedRun = await heartbeat.getRun(runId);
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: "process_lost" });
+    const retries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries).toHaveLength(1);
   });
 
   it("skips generic timer wakes without invoking an adapter when no assigned work is actionable", async () => {
