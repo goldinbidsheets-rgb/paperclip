@@ -8735,9 +8735,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(issues)
           .set({
             checkoutRunId: null,
-            executionRunId: retryRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(agent.name),
-            executionLockedAt: now,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
             updatedAt: now,
           })
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
@@ -9481,21 +9481,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const promoted = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "queued",
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.id, dueRun.id),
-          eq(heartbeatRuns.status, "scheduled_retry"),
-          lte(heartbeatRuns.scheduledRetryAt, now),
-        ),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const promoted = await db.transaction(async (tx) => {
+      const queued = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "queued",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, dueRun.id),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            lte(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (
+        queued &&
+        issueId &&
+        queued.scheduledRetryReason !== MAX_TURN_CONTINUATION_RETRY_REASON
+      ) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, queued.companyId),
+              eq(issues.executionRunId, queued.id),
+            ),
+          );
+      }
+
+      return queued;
+    });
     if (!promoted) return { outcome: "not_promoted", run: null };
 
     await appendRunEvent(promoted, await nextRunEventSeq(promoted.id), {

@@ -1702,7 +1702,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
-    expect(issue?.executionRunId).toBe(retryRun?.id);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {

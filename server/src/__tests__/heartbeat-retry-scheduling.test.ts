@@ -379,6 +379,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const sourceRunId = randomUUID();
+    const issueId = randomUUID();
     const now = new Date("2026-04-20T12:00:00.000Z");
 
     await db.insert(companies).values({
@@ -416,11 +417,26 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       errorCode: "adapter_failed",
       finishedAt: now,
       contextSnapshot: {
-        issueId: randomUUID(),
+        issueId,
         wakeReason: "issue_assigned",
       },
       updatedAt: now,
       createdAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry after upstream overload",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      executionRunId: sourceRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: now,
+      issueNumber: 1,
+      identifier: "T" + companyId.replace(/-/g, "").slice(0, 6).toUpperCase() + "-1",
     });
 
     const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
@@ -450,6 +466,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
     expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(expectedDueAt.toISOString());
 
+    const scheduledIssue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(scheduledIssue?.executionRunId).toBe(scheduled.run.id);
+
     const earlyPromotion = await heartbeat.promoteDueScheduledRetries(new Date("2026-04-20T12:01:59.000Z"));
     expect(earlyPromotion).toEqual({ promoted: 0, runIds: [] });
 
@@ -469,6 +492,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
     expect(promotedRun?.status).toBe("queued");
+
+    const releasedIssue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(releasedIssue?.executionRunId).toBeNull();
   });
 
   it("schedules max-turn continuations with distinct retry metadata", async () => {
