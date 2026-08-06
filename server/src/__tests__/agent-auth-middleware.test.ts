@@ -32,7 +32,14 @@ function createSelectChain(rowsForTable: (table: unknown) => unknown[]) {
 
 function createDbState(input: {
   agent: { id: string; companyId: string; status?: string };
-  agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null };
+  agentKey?: {
+    id: string;
+    agentId: string;
+    companyId: string;
+    keyHash: string;
+    responsibleUserId?: string | null;
+    revokedAt?: Date | null;
+  };
   run?: { id: string; companyId: string; agentId: string; responsibleUserId?: string | null };
 }) {
   const activity: Array<Record<string, unknown>> = [];
@@ -48,7 +55,7 @@ function createDbState(input: {
         companyId: input.agentKey.companyId,
         keyHash: input.agentKey.keyHash,
         responsibleUserId: input.agentKey.responsibleUserId ?? null,
-        revokedAt: null,
+        revokedAt: input.agentKey.revokedAt ?? null,
         scopeConfig: null,
       }
     : null;
@@ -65,7 +72,7 @@ function createDbState(input: {
     select: () =>
       createSelectChain((table) => {
         if (table === boardApiKeys) return [];
-        if (table === agentApiKeys) return keyRow ? [keyRow] : [];
+        if (table === agentApiKeys) return keyRow && keyRow.revokedAt === null ? [keyRow] : [];
         if (table === agents) return [agentRow];
         if (table === heartbeatRuns) return runRow ? [runRow] : [];
         return [];
@@ -203,6 +210,19 @@ describe("agent auth middleware", () => {
     expect(res.body).toEqual({ error: "Invalid Authorization header" });
   });
 
+  it("rejects a non-bearer Authorization scheme instead of downgrading to local-board", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId } });
+
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("Authorization", "Basic Zm9vOmJhcg==");
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Invalid Authorization header" });
+  });
+
   it("rejects an invalid bearer credential instead of downgrading to local-board", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -228,6 +248,53 @@ describe("agent auth middleware", () => {
       adapterType: "codex_local",
       runId,
       expiresAtSeconds: Math.floor(Date.now() / 1000) - 60,
+    });
+
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Invalid or expired bearer token" });
+  });
+
+  it("rejects a revoked agent key instead of downgrading to local-board", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_test_revoked_agent_key";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: {
+        id: randomUUID(),
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+        revokedAt: new Date(),
+      },
+    });
+
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Invalid or expired bearer token" });
+  });
+
+  it("rejects a key for a terminated agent instead of downgrading to local-board", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_test_terminated_agent_key";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId, status: "terminated" },
+      agentKey: {
+        id: randomUUID(),
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+      },
     });
 
     const res = await request(createApp(db, "local_trusted"))

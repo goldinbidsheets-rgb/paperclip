@@ -10,7 +10,7 @@ import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import {
   boardMutationGuard,
-  localImplicitMutationGuard,
+  localImplicitBrowserIntentGuard,
 } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
@@ -217,7 +217,12 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
-  app.use("/api/auth", localImplicitMutationGuard(), authRoutes(db));
+  const boardMutationOriginOptions = {
+    bindHost: opts.bindHost,
+    serverPort: opts.serverPort,
+    publicUrl: process.env.PAPERCLIP_PUBLIC_URL ?? null,
+  };
+  app.use("/api/auth", localImplicitBrowserIntentGuard(boardMutationOriginOptions), authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
@@ -228,8 +233,8 @@ export async function createApp(
 
   // Mount API routes
   const api = Router();
-  api.use(localImplicitMutationGuard());
-  api.use(boardMutationGuard());
+  api.use(localImplicitBrowserIntentGuard(boardMutationOriginOptions));
+  api.use(boardMutationGuard(boardMutationOriginOptions));
   api.use(
     "/health",
     healthRoutes(db, {

@@ -67,7 +67,11 @@ function createApp(input: {
     next();
   });
   if (input.guardMutations) {
-    app.use(boardMutationGuard());
+    app.use(boardMutationGuard({
+      bindHost: "paperclip.local",
+      serverPort: 80,
+      publicUrl: null,
+    }));
   }
   app.use(
     "/api",

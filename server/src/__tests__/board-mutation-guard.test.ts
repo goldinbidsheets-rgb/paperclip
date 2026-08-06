@@ -3,8 +3,14 @@ import express from "express";
 import request from "supertest";
 import {
   boardMutationGuard,
-  localImplicitMutationGuard,
+  localImplicitBrowserIntentGuard,
 } from "../middleware/board-mutation-guard.js";
+
+const ORIGIN_OPTIONS = {
+  bindHost: "127.0.0.1",
+  serverPort: 3200,
+  publicUrl: "https://paperclip.example.test",
+};
 
 function createApp(
   actorType: "board" | "agent",
@@ -18,7 +24,7 @@ function createApp(
       : { type: "agent", agentId: "agent-1" };
     next();
   });
-  app.use(boardMutationGuard());
+  app.use(boardMutationGuard(ORIGIN_OPTIONS));
   app.post("/mutate", (_req, res) => {
     res.status(204).end();
   });
@@ -43,8 +49,8 @@ function createProtectedApiApp(
   });
 
   const api = express.Router();
-  api.use(localImplicitMutationGuard());
-  api.use(boardMutationGuard());
+  api.use(localImplicitBrowserIntentGuard(ORIGIN_OPTIONS));
+  api.use(boardMutationGuard(ORIGIN_OPTIONS));
   const mutate = (_req: express.Request, res: express.Response) => {
     onMutation();
     res.status(204).end();
@@ -66,7 +72,7 @@ describe("boardMutationGuard", () => {
   });
 
   it("blocks board mutations without trusted origin", () => {
-    const middleware = boardMutationGuard();
+    const middleware = boardMutationGuard(ORIGIN_OPTIONS);
     const req = {
       method: "POST",
       actor: { type: "board", userId: "board", source: "session" },
@@ -105,64 +111,55 @@ describe("boardMutationGuard", () => {
     expect([200, 204]).toContain(res.status);
   });
 
-  it("allows board mutations from trusted origin", async () => {
+  it("allows board mutations from the configured bind origin", async () => {
+    const app = createApp("board");
+    const res = await request(app)
+      .post("/mutate")
+      .set("Origin", "http://127.0.0.1:3200")
+      .send({ ok: true });
+    expect([200, 204]).toContain(res.status);
+  });
+
+  it("allows board mutations from the configured public URL", async () => {
+    const app = createApp("board");
+    const res = await request(app)
+      .post("/mutate")
+      .set("Referer", "https://paperclip.example.test/issues/abc")
+      .send({ ok: true });
+    expect([200, 204]).toContain(res.status);
+  });
+
+  it("does not trust a caller-controlled Host", async () => {
+    const app = createApp("board");
+    const res = await request(app)
+      .post("/mutate")
+      .set("Host", "evil.example")
+      .set("Origin", "http://evil.example")
+      .send({ ok: true });
+    expect(res.status).toBe(403);
+  });
+
+  it("does not trust X-Forwarded-Host from the caller", async () => {
+    const app = createApp("board");
+    const res = await request(app)
+      .post("/mutate")
+      .set("X-Forwarded-Host", "attacker.test")
+      .set("Origin", "http://attacker.test")
+      .send({ ok: true });
+    expect(res.status).toBe(403);
+  });
+
+  it("does not retain the old hard-coded development origins", async () => {
     const app = createApp("board");
     const res = await request(app)
       .post("/mutate")
       .set("Origin", "http://localhost:3100")
       .send({ ok: true });
-    expect([200, 204]).toContain(res.status);
-  });
-
-  it("allows board mutations from trusted referer origin", async () => {
-    const app = createApp("board");
-    const res = await request(app)
-      .post("/mutate")
-      .set("Referer", "http://localhost:3100/issues/abc")
-      .send({ ok: true });
-    expect([200, 204]).toContain(res.status);
-  });
-
-  it("allows board mutations when x-forwarded-host matches origin", async () => {
-    const app = createApp("board");
-    const res = await request(app)
-      .post("/mutate")
-      .set("Host", "127.0.0.1")
-      .set("X-Forwarded-Host", "10.90.10.20:3443")
-      .set("Origin", "https://10.90.10.20:3443")
-      .send({ ok: true });
-    expect([200, 204]).toContain(res.status);
-  });
-
-  it("blocks board mutations when x-forwarded-host does not match origin", async () => {
-    const middleware = boardMutationGuard();
-    const req = {
-      method: "POST",
-      actor: { type: "board", userId: "board", source: "session" },
-      header: (name: string) => {
-        if (name === "host") return "127.0.0.1";
-        if (name === "x-forwarded-host") return "10.90.10.20:3443";
-        if (name === "origin") return "https://evil.example.com";
-        return undefined;
-      },
-    } as any;
-    const res = {
-      status: vi.fn().mockReturnThis(),
-      json: vi.fn(),
-    } as any;
-    const next = vi.fn();
-
-    middleware(req, res, next);
-
-    expect(next).not.toHaveBeenCalled();
-    expect(res.status).toHaveBeenCalledWith(403);
-    expect(res.json).toHaveBeenCalledWith({
-      error: "Board mutation requires trusted browser origin",
-    });
+    expect(res.status).toBe(403);
   });
 
   it("does not block authenticated agent mutations", async () => {
-    const middleware = boardMutationGuard();
+    const middleware = boardMutationGuard(ORIGIN_OPTIONS);
     const req = {
       method: "POST",
       actor: { type: "agent", agentId: "agent-1" },
@@ -181,15 +178,15 @@ describe("boardMutationGuard", () => {
   });
 });
 
-describe("localImplicitMutationGuard", () => {
+describe("localImplicitBrowserIntentGuard", () => {
   it("rejects a headerless comment before the mutation can supersede an interaction", async () => {
     const onMutation = vi.fn();
     const app = createProtectedApiApp("board", "local_implicit", onMutation);
 
     const res = await request(app).post("/api/issues/123/comments").send({ body: "hi" });
 
-    expect(res.status).toBe(401);
-    expect(res.body).toEqual({ error: "Authentication required for this mutation" });
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Local board mutation requires trusted browser origin" });
     expect(onMutation).not.toHaveBeenCalled();
   });
 
@@ -200,20 +197,62 @@ describe("localImplicitMutationGuard", () => {
       .set("Origin", "https://evil.example.com")
       .send({});
 
-    expect(res.status).toBe(401);
-    expect(res.body).toEqual({ error: "Authentication required for this mutation" });
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Local board mutation requires trusted browser origin" });
   });
 
-  it("allows a trusted same-origin browser mutation", async () => {
+  it("rejects the old hard-coded 127.0.0.1:3100 origin", async () => {
+    const app = createProtectedApiApp("board", "local_implicit");
+    const res = await request(app)
+      .post("/api/issues/123/checkout")
+      .set("Origin", "http://127.0.0.1:3100")
+      .send({});
+
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects the old hard-coded localhost:3100 referer", async () => {
+    const app = createProtectedApiApp("board", "local_implicit");
+    const res = await request(app)
+      .post("/api/issues/123/checkout")
+      .set("Referer", "http://localhost:3100/some/page")
+      .send({});
+
+    expect(res.status).toBe(403);
+  });
+
+  it("allows a browser mutation from the configured bind origin", async () => {
     const onMutation = vi.fn();
     const app = createProtectedApiApp("board", "local_implicit", onMutation);
     const res = await request(app)
       .put("/api/issues/123/documents/plan")
-      .set("Origin", "http://localhost:3100")
+      .set("Origin", "http://127.0.0.1:3200")
       .send({ body: "x" });
 
     expect(res.status).toBe(204);
     expect(onMutation).toHaveBeenCalledOnce();
+  });
+
+  it("rejects matching caller-controlled Host and Origin headers", async () => {
+    const app = createProtectedApiApp("board", "local_implicit");
+    const res = await request(app)
+      .post("/api/issues/123/checkout")
+      .set("Host", "evil.example")
+      .set("Origin", "http://evil.example")
+      .send({});
+
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects matching caller-controlled X-Forwarded-Host and Origin headers", async () => {
+    const app = createProtectedApiApp("board", "local_implicit");
+    const res = await request(app)
+      .post("/api/issues/123/checkout")
+      .set("X-Forwarded-Host", "attacker.test")
+      .set("Origin", "http://attacker.test")
+      .send({});
+
+    expect(res.status).toBe(403);
   });
 
   it("allows safe local-implicit reads without browser headers", async () => {

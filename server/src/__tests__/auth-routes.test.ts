@@ -2,7 +2,7 @@ import express from "express";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { errorHandler } from "../middleware/index.js";
-import { localImplicitMutationGuard } from "../middleware/board-mutation-guard.js";
+import { localImplicitBrowserIntentGuard } from "../middleware/board-mutation-guard.js";
 import { authRoutes } from "../routes/auth.js";
 
 function createSelectChain(rows: unknown[]) {
@@ -47,7 +47,15 @@ function createApp(actor: Express.Request["actor"], row: Record<string, unknown>
     req.actor = actor;
     next();
   });
-  app.use("/api/auth", localImplicitMutationGuard(), authRoutes(createDb(row)));
+  app.use(
+    "/api/auth",
+    localImplicitBrowserIntentGuard({
+      bindHost: "127.0.0.1",
+      serverPort: 3100,
+      publicUrl: null,
+    }),
+    authRoutes(createDb(row)),
+  );
   app.use(errorHandler);
   return app;
 }
@@ -94,7 +102,7 @@ describe.sequential("auth routes", () => {
 
     const res = await request(app)
       .patch("/api/auth/profile")
-      .set("Origin", "http://localhost:3100")
+      .set("Origin", "http://127.0.0.1:3100")
       .send({ name: "Board Operator", image: "" });
 
     expect(res.status).toBe(200);
@@ -114,8 +122,8 @@ describe.sequential("auth routes", () => {
 
     const res = await request(app).patch("/api/auth/profile").send({ name: "Blocked" });
 
-    expect(res.status).toBe(401);
-    expect(res.body).toEqual({ error: "Authentication required for this mutation" });
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Local board mutation requires trusted browser origin" });
   });
 
   it("preserves the existing avatar when updating only the profile name", async () => {
@@ -130,7 +138,7 @@ describe.sequential("auth routes", () => {
 
     const res = await request(app)
       .patch("/api/auth/profile")
-      .set("Origin", "http://localhost:3100")
+      .set("Origin", "http://127.0.0.1:3100")
       .send({ name: "Board Operator" });
 
     expect(res.status).toBe(200);

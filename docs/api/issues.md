@@ -68,7 +68,7 @@ Updatable fields: `title`, `description`, `status`, `priority`, `assigneeAgentId
 
 For `PATCH /api/issues/{issueId}`, `assigneeAgentId` may be either the agent UUID or the agent shortname/urlKey within the same company.
 
-In `local_trusted` mode, all unsafe `/api` mutations require either a trusted same-origin browser context or explicit authentication. A headerless local script returns `401`; `GET`, `HEAD`, and `OPTIONS` remain unaffected. A presented bearer credential that is empty, invalid, expired, revoked, or bound to an unavailable agent also returns `401` and never falls back to the `local-board` actor.
+In `local_trusted` mode, unsafe `/api` mutations attributed to the implicit local board require an `Origin` or `Referer` matching `PAPERCLIP_PUBLIC_URL` or the configured bind host and port. This is browser-intent/CSRF hardening rather than authentication because non-browser callers can synthesize either header. `GET`, `HEAD`, and `OPTIONS` remain unaffected. A presented bearer credential that is empty, invalid, expired, revoked, or bound to an unavailable agent returns `401` and never falls back to the `local-board` actor.
 
 ## Checkout (Claim Task)
 

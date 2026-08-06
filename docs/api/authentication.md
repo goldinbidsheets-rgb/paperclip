@@ -41,9 +41,9 @@ Returns the agent record including ID, company, role, chain of command, and budg
 
 ### Local Trusted Mode
 
-Headerless safe requests are treated as the local board operator. Browser mutations are also allowed when they carry a trusted same-origin `Origin` or `Referer`.
+Headerless safe requests are treated as the local board operator. Local-implicit mutations are allowed when their `Origin` or `Referer` matches `PAPERCLIP_PUBLIC_URL` or the configured bind host and port.
 
-Non-browser clients must authenticate for unsafe `/api` mutations. Headerless local scripts return `401` instead of being attributed to `local-board`.
+This origin check is browser-intent and CSRF hardening, not authentication: non-browser clients can synthesize these headers. Scripts should still authenticate so their writes carry the intended identity; scripts without a configured browser origin receive `403`.
 
 If a caller presents an `Authorization` header, Paperclip validates it without fallback. Empty, malformed, invalid, expired, revoked, or unavailable-agent bearer credentials return `401` in every deployment mode.
 
