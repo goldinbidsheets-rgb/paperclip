@@ -78,7 +78,10 @@ export function boardMutationGuard(opts: BoardMutationOriginOptions): RequestHan
   };
 }
 
-export function localImplicitBrowserIntentGuard(opts: BoardMutationOriginOptions): RequestHandler {
+export function localImplicitBrowserIntentGuard(
+  opts: BoardMutationOriginOptions,
+  exemptPaths?: ReadonlySet<string>,
+): RequestHandler {
   const allowedOrigins = trustedOriginsForConfig(opts);
   return (req, res, next) => {
     if (SAFE_METHODS.has(req.method.toUpperCase())) {
@@ -87,6 +90,11 @@ export function localImplicitBrowserIntentGuard(opts: BoardMutationOriginOptions
     }
 
     if (req.actor.type !== "board" || req.actor.source !== "local_implicit") {
+      next();
+      return;
+    }
+
+    if (exemptPaths?.has(req.path)) {
       next();
       return;
     }

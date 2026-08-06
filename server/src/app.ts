@@ -233,7 +233,10 @@ export async function createApp(
 
   // Mount API routes
   const api = Router();
-  api.use(localImplicitBrowserIntentGuard(boardMutationOriginOptions));
+  // CLI challenge-create has no actor and mints an inert token; exempt it so
+  // the headerless bootstrap POST is not blocked on local_trusted instances.
+  const localImplicitExempt = new Set(["/cli-auth/challenges"]);
+  api.use(localImplicitBrowserIntentGuard(boardMutationOriginOptions, localImplicitExempt));
   api.use(boardMutationGuard(boardMutationOriginOptions));
   api.use(
     "/health",
