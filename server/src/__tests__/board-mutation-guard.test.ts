@@ -5,6 +5,7 @@ import {
   boardMutationGuard,
   localImplicitBrowserIntentGuard,
 } from "../middleware/board-mutation-guard.js";
+import { logger } from "../middleware/logger.js";
 
 const ORIGIN_OPTIONS = {
   bindHost: "127.0.0.1",
@@ -274,5 +275,72 @@ describe("localImplicitBrowserIntentGuard", () => {
     const res = await request(app).post("/api/issues/123/checkout").send({});
 
     expect(res.status).toBe(204);
+  });
+});
+
+describe("guard rejection logging (R6 / GOLAA-13127)", () => {
+  function findEvent(spy: ReturnType<typeof vi.spyOn>) {
+    const call = spy.mock.calls.find(
+      (c) => (c[0] as Record<string, unknown> | undefined)?.event === "security.auth_guard_rejected",
+    );
+    return call?.[0] as Record<string, unknown> | undefined;
+  }
+
+  it("emits a structured security event when boardMutationGuard rejects", async () => {
+    const spy = vi.spyOn(logger, "warn").mockImplementation(() => logger as never);
+    try {
+      const app = createApp("board", "session");
+      const res = await request(app).post("/mutate").send({});
+      expect(res.status).toBe(403);
+
+      const fields = findEvent(spy);
+      expect(fields).toBeTruthy();
+      expect(fields!.guard).toBe("boardMutationGuard");
+      expect(fields!.method).toBe("POST");
+      expect(fields!.actorType).toBe("board");
+      expect(fields!.actorSource).toBe("session");
+      expect(fields!.originPresent).toBe(false);
+      expect(fields!.refererPresent).toBe(false);
+      // Never log the raw Origin/Referer values — presence booleans only.
+      expect(fields).not.toHaveProperty("origin");
+      expect(fields).not.toHaveProperty("referer");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("names localImplicitBrowserIntentGuard and reports origin presence on rejection", async () => {
+    const spy = vi.spyOn(logger, "warn").mockImplementation(() => logger as never);
+    try {
+      const app = createProtectedApiApp("board", "local_implicit");
+      const res = await request(app)
+        .post("/api/issues/123/checkout")
+        .set("Origin", "http://attacker.test")
+        .send({});
+      expect(res.status).toBe(403);
+
+      const fields = findEvent(spy);
+      expect(fields).toBeTruthy();
+      expect(fields!.guard).toBe("localImplicitBrowserIntentGuard");
+      expect(fields!.actorSource).toBe("local_implicit");
+      expect(fields!.originPresent).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not log a rejection event when a trusted origin is accepted", async () => {
+    const spy = vi.spyOn(logger, "warn").mockImplementation(() => logger as never);
+    try {
+      const app = createProtectedApiApp("board", "local_implicit");
+      const res = await request(app)
+        .post("/api/issues/123/checkout")
+        .set("Origin", "https://paperclip.example.test")
+        .send({});
+      expect(res.status).toBe(204);
+      expect(findEvent(spy)).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

@@ -1,4 +1,5 @@
 import type { Request, RequestHandler } from "express";
+import { logger } from "./logger.js";
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
@@ -34,6 +35,13 @@ function trustedOriginsForConfig(opts: BoardMutationOriginOptions) {
   return origins;
 }
 
+// SECURITY BOUNDARY NOTE: this origin/referer match is browser-intent and
+// CSRF hardening, NOT an authentication boundary. `Origin` and `Referer` are
+// client-supplied and forgeable — any non-browser client can set a trusted
+// origin and pass this check, so a passing result is never proof of identity.
+// Presented-credential mediation (Authorization / session validation) is
+// enforced separately in auth.ts and is the actual authentication boundary.
+// Do not add authorization decisions here that assume this cannot be spoofed.
 function hasConfiguredBrowserOrigin(req: Request, allowedOrigins: ReadonlySet<string>) {
   const origin = parseOrigin(req.header("origin"));
   if (origin && allowedOrigins.has(origin)) return true;
@@ -42,6 +50,27 @@ function hasConfiguredBrowserOrigin(req: Request, allowedOrigins: ReadonlySet<st
   if (refererOrigin && allowedOrigins.has(refererOrigin)) return true;
 
   return false;
+}
+
+// R6 (GOLAA-13127): guard rejections are security events. Emit a structured
+// line so forging attempts (a script setting a spoofed Origin, see the boundary
+// note above) are detectable and the accidental-write rate is measurable after
+// deploy. Presence booleans only — never the Origin/Referer values — so no host
+// or PII leaks into logs.
+function logGuardRejection(req: Request, guard: string) {
+  logger.warn(
+    {
+      event: "security.auth_guard_rejected",
+      guard,
+      method: req.method,
+      path: req.path,
+      actorType: req.actor.type,
+      actorSource: req.actor.source,
+      originPresent: Boolean(req.header("origin")),
+      refererPresent: Boolean(req.header("referer")),
+    },
+    "board mutation guard rejected untrusted-origin request",
+  );
 }
 
 export function boardMutationGuard(opts: BoardMutationOriginOptions): RequestHandler {
@@ -70,6 +99,7 @@ export function boardMutationGuard(opts: BoardMutationOriginOptions): RequestHan
     }
 
     if (!hasConfiguredBrowserOrigin(req, allowedOrigins)) {
+      logGuardRejection(req, "boardMutationGuard");
       res.status(403).json({ error: "Board mutation requires trusted browser origin" });
       return;
     }
@@ -100,6 +130,7 @@ export function localImplicitBrowserIntentGuard(
     }
 
     if (!hasConfiguredBrowserOrigin(req, allowedOrigins)) {
+      logGuardRejection(req, "localImplicitBrowserIntentGuard");
       res.status(403).json({ error: "Local board mutation requires trusted browser origin" });
       return;
     }
