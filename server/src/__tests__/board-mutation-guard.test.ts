@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import express from "express";
 import request from "supertest";
-import { boardMutationGuard } from "../middleware/board-mutation-guard.js";
+import {
+  boardMutationGuard,
+  localImplicitMutationGuard,
+} from "../middleware/board-mutation-guard.js";
 
 function createApp(
   actorType: "board" | "agent",
@@ -22,6 +25,36 @@ function createApp(
   app.get("/read", (_req, res) => {
     res.status(204).end();
   });
+  return app;
+}
+
+function createProtectedApiApp(
+  actorType: "board" | "agent",
+  boardSource: "session" | "local_implicit" | "board_key" | "cloud_tenant" = "session",
+  onMutation: () => void = () => undefined,
+) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.actor = actorType === "board"
+      ? { type: "board", userId: "board", source: boardSource }
+      : { type: "agent", agentId: "agent-1" };
+    next();
+  });
+
+  const api = express.Router();
+  api.use(localImplicitMutationGuard());
+  api.use(boardMutationGuard());
+  const mutate = (_req: express.Request, res: express.Response) => {
+    onMutation();
+    res.status(204).end();
+  };
+  api.post("/issues/:id/comments", mutate);
+  api.post("/issues/:id/checkout", mutate);
+  api.put("/issues/:id/documents/:key", mutate);
+  api.get("/probe", mutate);
+  app.use("/api", api);
+
   return app;
 }
 
@@ -145,5 +178,62 @@ describe("boardMutationGuard", () => {
 
     expect(next).toHaveBeenCalledOnce();
     expect(res.status).not.toHaveBeenCalled();
+  });
+});
+
+describe("localImplicitMutationGuard", () => {
+  it("rejects a headerless comment before the mutation can supersede an interaction", async () => {
+    const onMutation = vi.fn();
+    const app = createProtectedApiApp("board", "local_implicit", onMutation);
+
+    const res = await request(app).post("/api/issues/123/comments").send({ body: "hi" });
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Authentication required for this mutation" });
+    expect(onMutation).not.toHaveBeenCalled();
+  });
+
+  it("rejects an untrusted local-implicit origin", async () => {
+    const app = createProtectedApiApp("board", "local_implicit");
+    const res = await request(app)
+      .post("/api/issues/123/checkout")
+      .set("Origin", "https://evil.example.com")
+      .send({});
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Authentication required for this mutation" });
+  });
+
+  it("allows a trusted same-origin browser mutation", async () => {
+    const onMutation = vi.fn();
+    const app = createProtectedApiApp("board", "local_implicit", onMutation);
+    const res = await request(app)
+      .put("/api/issues/123/documents/plan")
+      .set("Origin", "http://localhost:3100")
+      .send({ body: "x" });
+
+    expect(res.status).toBe(204);
+    expect(onMutation).toHaveBeenCalledOnce();
+  });
+
+  it("allows safe local-implicit reads without browser headers", async () => {
+    const app = createProtectedApiApp("board", "local_implicit");
+    const res = await request(app).get("/api/probe");
+
+    expect(res.status).toBe(204);
+  });
+
+  it("allows authenticated agents without browser headers", async () => {
+    const app = createProtectedApiApp("agent");
+    const res = await request(app).post("/api/issues/123/checkout").send({});
+
+    expect(res.status).toBe(204);
+  });
+
+  it("allows board bearer keys without browser headers", async () => {
+    const app = createProtectedApiApp("board", "board_key");
+    const res = await request(app).post("/api/issues/123/checkout").send({});
+
+    expect(res.status).toBe(204);
   });
 });

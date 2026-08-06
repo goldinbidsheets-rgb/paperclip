@@ -46,6 +46,8 @@ Paperclip now treats **bind** as a separate concern from auth:
 - loopback-only host binding
 - no human login flow
 - optimized for fastest local startup
+- unsafe `/api` mutations by local-implicit board actors require a trusted same-origin
+  `Origin` or `Referer`; scripts and other non-browser clients must authenticate
 
 ## `authenticated + private`
 

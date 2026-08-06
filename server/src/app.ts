@@ -8,7 +8,10 @@ import type { InspectDatabaseBackupHealthOptions } from "./services/database-bac
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
-import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
+import {
+  boardMutationGuard,
+  localImplicitMutationGuard,
+} from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
 import { healthRoutes } from "./routes/health.js";
@@ -214,7 +217,7 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
-  app.use("/api/auth", authRoutes(db));
+  app.use("/api/auth", localImplicitMutationGuard(), authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
@@ -225,6 +228,7 @@ export async function createApp(
 
   // Mount API routes
   const api = Router();
+  api.use(localImplicitMutationGuard());
   api.use(boardMutationGuard());
   api.use(
     "/health",
