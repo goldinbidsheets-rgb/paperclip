@@ -387,6 +387,76 @@ describeEmbeddedPostgres("stale queued execution-lock reaper", () => {
     });
   }, 20_000);
 
+  it("still reaps within a bounded grace when the agent keeps finishing later runs", async () => {
+    // GOLAA-8435 F4 regression: a rolling MAX anchor let any agent that
+    // finishes work more than once per hour push staleAt forward forever, so
+    // the backstop never fired on a busy agent. The anchor is the FIRST
+    // capacity release at/after eligibility, so continued activity cannot
+    // extend the grace. Fails against the rolling-MAX build (staleAt anchored
+    // to 12:45 -> 13:45, so no reap at 13:00).
+    const seeded = await seedLockedQueuedRun();
+    // First release at/after eligibility, then the agent stays busy every 15m.
+    const releaseTimes = [
+      "2026-07-29T11:59:30.000Z",
+      "2026-07-29T12:15:00.000Z",
+      "2026-07-29T12:30:00.000Z",
+      "2026-07-29T12:45:00.000Z",
+    ];
+    for (const finishedAtIso of releaseTimes) {
+      const siblingIssueId = randomUUID();
+      const siblingRunId = randomUUID();
+      const finishedAt = new Date(finishedAtIso);
+      const startedAt = new Date(finishedAt.getTime() - 30_000);
+      await db.insert(issues).values({
+        id: siblingIssueId,
+        companyId: seeded.companyId,
+        title: "Sibling capacity work",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: seeded.agentId,
+        createdAt: startedAt,
+        updatedAt: finishedAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: siblingRunId,
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "succeeded",
+        startedAt,
+        finishedAt,
+        contextSnapshot: { issueId: siblingIssueId },
+        createdAt: startedAt,
+        updatedAt: finishedAt,
+      });
+    }
+
+    // Before first-release + 1h grace: preserved (proves grace is measured
+    // from the capacity release, not eligibility, which is >30h earlier).
+    const beforeGrace = await heartbeat.reapStaleQueuedExecutionLocks({
+      now: new Date("2026-07-29T12:30:00.000Z"),
+    });
+    expect(beforeGrace).toEqual({ reaped: 0, runIds: [], issueIds: [] });
+
+    // After first-release + 1h (11:59:30 -> 12:59:30), the lock is reaped even
+    // though a later sibling finished at 12:45; the anchor did not move.
+    const afterGrace = await heartbeat.reapStaleQueuedExecutionLocks({
+      now: new Date("2026-07-29T13:00:00.000Z"),
+    });
+    expect(afterGrace).toEqual({
+      reaped: 1,
+      runIds: [seeded.runId],
+      issueIds: [seeded.issueId],
+    });
+    const reapedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.runId))
+      .then((rows) => rows[0]);
+    expect(reapedRun?.status).toBe("cancelled");
+  }, 20_000);
+
   it("is a no-op when a claim wins after stale-candidate discovery", async () => {
     const seeded = await seedLockedQueuedRun();
     const lockReady = deferred();

@@ -12882,21 +12882,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null);
       if (!lockedIssue) return null;
 
+      // Anchor grace to the first capacity release at/after this run's
+      // eligibility (a MIN, so later unrelated work cannot push it forward),
+      // scoped to the run's own company+agent so the aggregate can use the
+      // (company_id, agent_id, started_at) index prefix instead of a
+      // cross-tenant scan.
+      const eligibilityAt = lockedRun.scheduledRetryAt ?? lockedRun.createdAt;
       const agentCapacity = await tx
         .select({
           hasRunningRun: sql<boolean>`coalesce(bool_or(${heartbeatRuns.status} = 'running'), false)`,
-          latestFinishedRunAt: sql`max(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null)`
+          capacityReleaseAt: sql`min(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null and ${heartbeatRuns.finishedAt} >= ${eligibilityAt})`
             .mapWith(heartbeatRuns.finishedAt),
         })
         .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.agentId, lockedRun.agentId))
+        .where(and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, lockedRun.agentId),
+        ))
         .then((rows) => rows[0] ?? null);
       const classification = classifyStaleQueuedExecutionLock({
         issue: lockedIssue,
         run: lockedRun,
         wakeup: lockedWakeup,
         agentHasRunningRun: agentCapacity?.hasRunningRun ?? false,
-        agentLatestFinishedRunAt: agentCapacity?.latestFinishedRunAt ?? null,
+        agentCapacityReleaseAt: agentCapacity?.capacityReleaseAt ?? null,
         now: input.now,
       });
       if (!classification.stale) return null;
@@ -12978,7 +12987,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         wakeupRequestId: lockedWakeup.id,
         eligibilityAt: classification.eligibilityAt.toISOString(),
         graceAnchorAt: classification.graceAnchorAt.toISOString(),
-        agentLatestFinishedRunAt: classification.agentLatestFinishedRunAt?.toISOString() ?? null,
+        agentCapacityReleaseAt: classification.agentCapacityReleaseAt?.toISOString() ?? null,
         staleAt: classification.staleAt.toISOString(),
         graceMs: classification.graceMs,
       };
@@ -13057,31 +13066,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
       ));
 
-    const candidateAgentIds = [...new Set(candidates.map((candidate) => candidate.run.agentId))];
-    const agentCapacityRows = candidateAgentIds.length > 0
-      ? await db
-          .select({
-            agentId: heartbeatRuns.agentId,
-            hasRunningRun: sql<boolean>`coalesce(bool_or(${heartbeatRuns.status} = 'running'), false)`,
-            latestFinishedRunAt: sql`max(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null)`
-              .mapWith(heartbeatRuns.finishedAt),
-          })
-          .from(heartbeatRuns)
-          .where(inArray(heartbeatRuns.agentId, candidateAgentIds))
-          .groupBy(heartbeatRuns.agentId)
-      : [];
-    const agentCapacityById = new Map(agentCapacityRows.map((row) => [row.agentId, row]));
     const reapedRunIds: string[] = [];
     const reapedIssueIds: string[] = [];
     const visitedRunIds = new Set<string>();
     for (const candidate of candidates) {
       if (visitedRunIds.has(candidate.run.id)) continue;
       visitedRunIds.add(candidate.run.id);
-      const agentCapacity = agentCapacityById.get(candidate.run.agentId);
+      // Anchor grace to the first capacity release at/after this run's own
+      // eligibility, scoped to its company+agent. Computed per candidate
+      // because eligibility is per-run; the candidate set is already filtered
+      // to queued execution-lock holders (empty on a healthy board), so this
+      // is a tiny loop, not a fan-out over every agent's whole run history.
+      const eligibilityAt = candidate.run.scheduledRetryAt ?? candidate.run.createdAt;
+      const agentCapacity = await db
+        .select({
+          hasRunningRun: sql<boolean>`coalesce(bool_or(${heartbeatRuns.status} = 'running'), false)`,
+          capacityReleaseAt: sql`min(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null and ${heartbeatRuns.finishedAt} >= ${eligibilityAt})`
+            .mapWith(heartbeatRuns.finishedAt),
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, candidate.run.companyId),
+          eq(heartbeatRuns.agentId, candidate.run.agentId),
+        ))
+        .then((rows) => rows[0] ?? null);
       const preliminary = classifyStaleQueuedExecutionLock({
         ...candidate,
         agentHasRunningRun: agentCapacity?.hasRunningRun ?? false,
-        agentLatestFinishedRunAt: agentCapacity?.latestFinishedRunAt ?? null,
+        agentCapacityReleaseAt: agentCapacity?.capacityReleaseAt ?? null,
         now,
       });
       if (!preliminary.stale) continue;
