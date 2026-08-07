@@ -39,6 +39,7 @@ function createProtectedApiApp(
   actorType: "board" | "agent",
   boardSource: "session" | "local_implicit" | "board_key" | "cloud_tenant" = "session",
   onMutation: () => void = () => undefined,
+  exemptPaths?: ReadonlySet<string>,
 ) {
   const app = express();
   app.use(express.json());
@@ -50,7 +51,7 @@ function createProtectedApiApp(
   });
 
   const api = express.Router();
-  api.use(localImplicitBrowserIntentGuard(ORIGIN_OPTIONS));
+  api.use(localImplicitBrowserIntentGuard(ORIGIN_OPTIONS, exemptPaths));
   api.use(boardMutationGuard(ORIGIN_OPTIONS));
   const mutate = (_req: express.Request, res: express.Response) => {
     onMutation();
@@ -60,6 +61,8 @@ function createProtectedApiApp(
   api.post("/issues/:id/checkout", mutate);
   api.put("/issues/:id/documents/:key", mutate);
   api.get("/probe", mutate);
+  api.post("/cli-auth/challenges", mutate);
+  api.post("/cli-auth/challenges/:id/approve", mutate);
   app.use("/api", api);
 
   return app;
@@ -339,6 +342,80 @@ describe("guard rejection logging (R6 / GOLAA-13127)", () => {
         .send({});
       expect(res.status).toBe(204);
       expect(findEvent(spy)).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+// GOLAA-13126: POST /api/cli-auth/challenges is the headerless CLI bootstrap
+// that mints a board credential. Guarding it deadlocks `board login` on
+// local_trusted instances — the credential is required to mutate, and the
+// credential-minting mutation is itself gated. The exemption must stay exact:
+// the challenge is inert until approved, and the approve step is the real control.
+describe("localImplicitBrowserIntentGuard exempt paths (GOLAA-13126)", () => {
+  // Must mirror `localImplicitExempt` in app.ts.
+  const CLI_CHALLENGE_EXEMPT = new Set(["/cli-auth/challenges"]);
+
+  it("allows the headerless CLI challenge-create bootstrap on local_implicit", async () => {
+    const onMutation = vi.fn();
+    const app = createProtectedApiApp("board", "local_implicit", onMutation, CLI_CHALLENGE_EXEMPT);
+    // No Authorization, no Origin, no Referer — exactly what cli/src/client/board-auth.ts sends.
+    const res = await request(app).post("/api/cli-auth/challenges").send({});
+
+    expect(res.status).toBe(204);
+    expect(onMutation).toHaveBeenCalledOnce();
+  });
+
+  it("still blocks the challenge-approve step headerless (exact match, not prefix)", async () => {
+    const onMutation = vi.fn();
+    const app = createProtectedApiApp("board", "local_implicit", onMutation, CLI_CHALLENGE_EXEMPT);
+    const res = await request(app).post("/api/cli-auth/challenges/abc123/approve").send({});
+
+    expect(res.status).toBe(403);
+    expect(onMutation).not.toHaveBeenCalled();
+  });
+
+  it("blocks the same challenge-create request when no exempt set is configured", async () => {
+    const onMutation = vi.fn();
+    const app = createProtectedApiApp("board", "local_implicit", onMutation);
+    const res = await request(app).post("/api/cli-auth/challenges").send({});
+
+    // Pre-fix behavior: proves the exemption — not a broader regression — opens the path.
+    expect(res.status).toBe(403);
+    expect(onMutation).not.toHaveBeenCalled();
+  });
+
+  it("does not open unrelated mutations when the exempt set is configured", async () => {
+    const onMutation = vi.fn();
+    const app = createProtectedApiApp("board", "local_implicit", onMutation, CLI_CHALLENGE_EXEMPT);
+    const res = await request(app).post("/api/issues/123/comments").send({ body: "x" });
+
+    expect(res.status).toBe(403);
+    expect(onMutation).not.toHaveBeenCalled();
+  });
+
+  it("leaves the trusted-browser path to challenge-create unchanged", async () => {
+    const app = createProtectedApiApp("board", "local_implicit", () => undefined, CLI_CHALLENGE_EXEMPT);
+    const res = await request(app)
+      .post("/api/cli-auth/challenges")
+      .set("Origin", "https://paperclip.example.test")
+      .send({});
+
+    expect(res.status).toBe(204);
+  });
+
+  it("does not log a guard rejection for the exempt bootstrap path", async () => {
+    const spy = vi.spyOn(logger, "warn").mockImplementation(() => logger as never);
+    try {
+      const app = createProtectedApiApp("board", "local_implicit", () => undefined, CLI_CHALLENGE_EXEMPT);
+      const res = await request(app).post("/api/cli-auth/challenges").send({});
+      expect(res.status).toBe(204);
+
+      const rejected = spy.mock.calls.find(
+        (c) => (c[0] as Record<string, unknown> | undefined)?.event === "security.auth_guard_rejected",
+      );
+      expect(rejected).toBeUndefined();
     } finally {
       spy.mockRestore();
     }
