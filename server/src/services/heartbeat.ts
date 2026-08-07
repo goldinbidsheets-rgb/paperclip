@@ -428,6 +428,15 @@ export const WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS = RECOVERY_ACTIVE_RUN_OUTPUT_S
 // other value — including agent_default and an absent mode — may still resolve
 // to the shared workspace and counts as a holder.
 const ISOLATED_EXECUTION_WORKSPACE_MODES = ["isolated_workspace", "operator_branch", "isolated"] as const;
+// postgres.js serializes bind parameters itself and rejects a raw JS Date
+// ("The 'string' argument must be of type string ... Received an instance of
+// Date"). Drizzle maps Dates only for column-typed comparisons, never for a
+// value interpolated into a raw sql`` fragment, so a Date bound that way has to
+// be handed over as an ISO string with an explicit ::timestamptz cast — the
+// idiom already used everywhere else in this file.
+function toTimestamptzParam(value: Date | string | number): string {
+  return (value instanceof Date ? value : new Date(value)).toISOString();
+}
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -12888,10 +12897,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // (company_id, agent_id, started_at) index prefix instead of a
       // cross-tenant scan.
       const eligibilityAt = lockedRun.scheduledRetryAt ?? lockedRun.createdAt;
+      const eligibilityAtParam = toTimestamptzParam(eligibilityAt);
       const agentCapacity = await tx
         .select({
           hasRunningRun: sql<boolean>`coalesce(bool_or(${heartbeatRuns.status} = 'running'), false)`,
-          capacityReleaseAt: sql`min(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null and ${heartbeatRuns.finishedAt} >= ${eligibilityAt})`
+          capacityReleaseAt: sql`min(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null and ${heartbeatRuns.finishedAt} >= ${eligibilityAtParam}::timestamptz)`
             .mapWith(heartbeatRuns.finishedAt),
         })
         .from(heartbeatRuns)
@@ -13078,10 +13088,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // to queued execution-lock holders (empty on a healthy board), so this
       // is a tiny loop, not a fan-out over every agent's whole run history.
       const eligibilityAt = candidate.run.scheduledRetryAt ?? candidate.run.createdAt;
+      const eligibilityAtParam = toTimestamptzParam(eligibilityAt);
       const agentCapacity = await db
         .select({
           hasRunningRun: sql<boolean>`coalesce(bool_or(${heartbeatRuns.status} = 'running'), false)`,
-          capacityReleaseAt: sql`min(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null and ${heartbeatRuns.finishedAt} >= ${eligibilityAt})`
+          capacityReleaseAt: sql`min(${heartbeatRuns.finishedAt}) filter (where ${heartbeatRuns.startedAt} is not null and ${heartbeatRuns.finishedAt} >= ${eligibilityAtParam}::timestamptz)`
             .mapWith(heartbeatRuns.finishedAt),
         })
         .from(heartbeatRuns)
