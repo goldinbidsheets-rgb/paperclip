@@ -49,16 +49,27 @@ function createDb(input: Fixture) {
 function createApp(fixture: Fixture) {
   const db = createDb(fixture);
   const app = express();
+  const writes = new Map<string, Record<string, string | null>>();
   app.use(express.json());
   app.use('/api/auth/agent-run-token', agentRunTokenRoutes(db));
   app.use(actorMiddleware(db, { deploymentMode: 'authenticated', resolveSession: async () => null }));
   app.post('/write-probe', (req, res) => {
-    const isAgent = req.actor.type === 'agent';
-    res.status(isAgent ? 201 : 401).json({
+    if (req.actor.type !== 'agent') {
+      res.status(401).json({ error: 'Agent authentication required' });
+      return;
+    }
+    const persisted = {
+      id: randomUUID(),
       authorType: req.actor.type,
-      authorAgentId: isAgent ? req.actor.agentId : null,
-      createdByRunId: isAgent ? req.actor.runId : null,
-    });
+      authorAgentId: req.actor.agentId,
+      createdByRunId: req.actor.runId,
+    };
+    writes.set(persisted.id, persisted);
+    res.status(201).json(persisted);
+  });
+  app.get('/write-probe/:id', (req, res) => {
+    const persisted = writes.get(req.params.id);
+    res.status(persisted ? 200 : 404).json(persisted ?? { error: 'Write not found' });
   });
   app.use(errorHandler);
   return app;
@@ -97,7 +108,7 @@ describe('agent run token refresh', () => {
     else process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = originalTtl;
   });
 
-  it('refreshes an expired active-run JWT and preserves agent write attribution', async () => {
+  it('refreshes an expired active-run JWT and preserves persisted attribution on read-back', async () => {
     const fixture = {
       companyId: randomUUID(),
       agentId: randomUUID(),
@@ -166,6 +177,12 @@ describe('agent run token refresh', () => {
       authorAgentId: fixture.agentId,
       createdByRunId: fixture.runId,
     });
+
+    const readBack = await request(app)
+      .get('/write-probe/' + refreshedWrite.body.id)
+      .set('Authorization', 'Bearer ' + refresh.body.token);
+    expect(readBack.status).toBe(200);
+    expect(readBack.body).toEqual(refreshedWrite.body);
   });
 
   it.each([
