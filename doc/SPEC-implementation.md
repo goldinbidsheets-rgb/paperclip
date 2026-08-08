@@ -519,6 +519,8 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 ## 9.2 Agent Auth
 
 - Bearer API key mapped to one agent and company
+- Local adapter heartbeats receive a short-lived, run-scoped JWT rather than a long-lived agent key.
+- A signed run JWT, including an expired one, may be exchanged at `POST /api/auth/agent-run-token/refresh` only while the matching heartbeat run is still `running` and the matching agent remains invokable. The request must include the JWT's exact run id in `X-Paperclip-Run-Id`; the replacement preserves agent, company, adapter, responsible-user, run, and key-scope claims.
 - Agent key scope:
   - read org/task/company context for own company
   - read/write own assigned tasks and comments

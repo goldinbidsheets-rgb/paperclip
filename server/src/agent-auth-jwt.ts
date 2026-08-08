@@ -154,7 +154,10 @@ export function createLocalAgentJwt(
   return `${signingInput}.${signature}`;
 }
 
-export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
+function verifyLocalAgentJwtClaims(
+  token: string,
+  options: { allowExpired: boolean },
+): LocalAgentJwtClaims | null {
   if (!token) return null;
   const config = jwtConfig();
   if (!config) return null;
@@ -216,7 +219,7 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
   const companyId = claimedCompanyId;
 
   const now = Math.floor(Date.now() / 1000);
-  if (exp < now) return null;
+  if (!options.allowExpired && exp < now) return null;
 
   const issuer = typeof claims.iss === "string" ? claims.iss : undefined;
   const audience = typeof claims.aud === "string" ? claims.aud : undefined;
@@ -246,4 +249,17 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
     ...(instanceClaim ? { instance_id: instanceClaim } : {}),
     jti: typeof claims.jti === "string" ? claims.jti : undefined,
   };
+}
+
+export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
+  return verifyLocalAgentJwtClaims(token, { allowExpired: false });
+}
+
+/**
+ * Verify a run JWT for the refresh endpoint without enforcing its access-token
+ * expiry. Callers MUST separately prove that the signed run is still active
+ * before minting a replacement; this helper is not valid for API authorization.
+ */
+export function verifyRefreshableLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
+  return verifyLocalAgentJwtClaims(token, { allowExpired: true });
 }

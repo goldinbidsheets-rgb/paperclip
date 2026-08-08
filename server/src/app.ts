@@ -54,6 +54,7 @@ import {
 } from "./routes/instance-database-backups.js";
 import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
+import { agentRunTokenRoutes } from ./routes/agent-run-token.js;
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
@@ -208,6 +209,7 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
+  app.use("/api/auth/agent-run-token", agentRunTokenRoutes(db));
   app.use(
     actorMiddleware(db, {
       deploymentMode: opts.deploymentMode,
