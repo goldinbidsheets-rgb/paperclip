@@ -6469,6 +6469,7 @@ export function issueService(db: Db) {
       data: Partial<typeof issues.$inferInsert> & {
         labelIds?: string[];
         blockedByIssueIds?: string[];
+        expectedStatuses?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
       },
@@ -6484,6 +6485,7 @@ export function issueService(db: Db) {
       const {
         labelIds: nextLabelIds,
         blockedByIssueIds,
+        expectedStatuses,
         actorAgentId,
         actorUserId,
         ...issueData
@@ -6635,7 +6637,11 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(eq(issues.id, id))
+          .where(
+            expectedStatuses === undefined
+              ? eq(issues.id, id)
+              : and(eq(issues.id, id), inArray(issues.status, expectedStatuses)),
+          )
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;

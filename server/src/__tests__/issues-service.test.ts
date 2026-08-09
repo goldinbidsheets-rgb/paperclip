@@ -502,6 +502,28 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it.each(["done", "cancelled"] as const)(
+    "does not update a %s issue when its expected live status no longer matches",
+    async (terminalStatus) => {
+      const companyId = await seedAssignableAgentCompany();
+      const issue = await svc.create(companyId, {
+        title: "Preserve terminal status",
+        description: null,
+        status: terminalStatus,
+        priority: "medium",
+      });
+
+      const updated = await svc.update(issue.id, {
+        status: "blocked",
+        expectedStatuses: ["in_progress"],
+      });
+
+      expect(updated).toBeNull();
+      const persisted = await svc.getById(issue.id);
+      expect(persisted?.status).toBe(terminalStatus);
+    },
+  );
+
   it("resolves only structured same-company agent mentions", async () => {
     const companyId = await seedAssignableAgentCompany();
     const otherCompanyId = await seedAssignableAgentCompany();

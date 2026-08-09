@@ -3014,7 +3014,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+      expectedStatuses: [input.previousStatus],
+    });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -3151,6 +3154,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    const liveIssue = await issuesSvc.getById(input.issue.id);
+    if (
+      !liveIssue ||
+      (liveIssue.status !== "todo" && liveIssue.status !== "in_progress" && liveIssue.status !== "in_review")
+    ) {
+      return null;
+    }
+    input = {
+      ...input,
+      issue: liveIssue,
+      previousStatus: liveIssue.status,
+    };
+
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -3184,6 +3200,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       status: "blocked",
       blockedByIssueIds: blockerIds,
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      expectedStatuses: [input.previousStatus],
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
@@ -3314,6 +3331,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .limit(1);
       if (
         currentIssue &&
+        currentIssue.status !== "done" &&
+        currentIssue.status !== "cancelled" &&
         (currentIssue.status !== "blocked" ||
           currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
       ) {
@@ -3321,6 +3340,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           status: "blocked",
           blockedByIssueIds: blockerIds,
           assigneeAgentId: recoveryAction.ownerAgentId,
+          expectedStatuses: [currentIssue.status],
         });
         if (reblocked) return reblocked;
       }
