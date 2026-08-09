@@ -567,7 +567,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("allows mention-granted non-assignee agent POST comments on closed issues without reopening", async () => {
+  it("allows comment-granted non-assignee agent POST comments on closed issues without reopening", async () => {
     const mentionedAgentId = "33333333-3333-4333-8333-333333333333";
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
@@ -585,8 +585,8 @@ describe.sequential("issue comment reopen routes", () => {
       return {
         allowed,
         action: input.action,
-        reason: allowed ? "allow_issue_mention_grant" : "deny_missing_grant",
-        explanation: allowed ? "Allowed by a mention-scoped issue comment grant." : "Missing permission.",
+        reason: allowed ? "allow_issue_comment_grant" : "deny_missing_grant",
+        explanation: allowed ? "Allowed by an issue-scoped comment collaborator grant." : "Missing permission.",
       };
     });
 
@@ -605,8 +605,8 @@ describe.sequential("issue comment reopen routes", () => {
     ["resume", { resume: true }],
     ["reopen", { reopen: true }],
   ])(
-    // Mention grants are append-only; explicit lifecycle intent still requires mutation authority.
-    "denies mention-granted non-assignee agent POST comments on closed issues with %s intent",
+    // Collaborator grants are comment-only; lifecycle intent is rejected before mutation checks.
+    "denies comment-granted non-assignee agent POST comments on closed issues with %s intent",
     async (_name, intent) => {
       const mentionedAgentId = "33333333-3333-4333-8333-333333333333";
       mockIssueService.getById.mockResolvedValue(makeIssue("done"));
@@ -625,8 +625,8 @@ describe.sequential("issue comment reopen routes", () => {
         return {
           allowed,
           action: input.action,
-          reason: allowed ? "allow_issue_mention_grant" : "deny_missing_grant",
-          explanation: allowed ? "Allowed by a mention-scoped issue comment grant." : "Missing permission.",
+          reason: allowed ? "allow_issue_comment_grant" : "deny_missing_grant",
+          explanation: allowed ? "Allowed by an issue-scoped comment collaborator grant." : "Missing permission.",
         };
       });
 
@@ -635,9 +635,12 @@ describe.sequential("issue comment reopen routes", () => {
         .send({ body: "Please continue this closed issue.", ...intent });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body).toEqual({ error: "Issue is outside this actor's authorization boundary" });
+      expect(res.body).toEqual({
+        error: "Issue comment collaborator grant authorizes comment creation only",
+        details: { capability: "comment:create" },
+      });
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
-      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();

@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
+  activityLog,
   authUsers,
   companies,
   companyMemberships,
   createDb,
   instanceUserRoles,
+  issueAgentCollaboratorGrants,
   issueComments,
   issues,
   principalPermissionGrants,
@@ -19,6 +22,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { authorizationService } from "../services/authorization.js";
+import { issueCommentGrantService } from "../services/issue-comment-grants.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -169,9 +173,11 @@ describeEmbeddedPostgres("authorization service", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-authorization-service-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
+    await db.delete(issueAgentCollaboratorGrants);
     await db.delete(issueComments);
     await db.delete(userInboxAgentPolicies);
     await db.delete(principalPermissionGrants);
@@ -1134,7 +1140,7 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
-  it("allows mentioned agents to read and comment on assigned issues without granting issue mutation", async () => {
+  it("limits explicit issue collaborator grants to comment creation on the exact issue until revoked", async () => {
     const company = await createCompany(db, "MentionCommentAuth");
     const allowedProject = await createProject(db, company.id, "MentionAllowed");
     const targetProject = await createProject(db, company.id, "MentionTarget");
@@ -1198,11 +1204,25 @@ describeEmbeddedPostgres("authorization service", () => {
 
     await expect(authorization.decide({
       actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+
+    const grant = await db.insert(issueAgentCollaboratorGrants).values({
+      companyId: company.id,
+      issueId: issue.id,
+      granteeAgentId: mentionedAgent.id,
+      grantedByActorType: "agent",
+      grantedByActorId: ownerAgent.id,
+    }).returning().then((rows) => rows[0]!);
+
+    await expect(authorization.decide({
+      actor,
       action: "issue:read",
       resource,
     })).resolves.toMatchObject({
-      allowed: true,
-      reason: "allow_issue_mention_grant",
+      allowed: false,
+      reason: "deny_low_trust_boundary",
     });
     await expect(authorization.decide({
       actor,
@@ -1210,16 +1230,122 @@ describeEmbeddedPostgres("authorization service", () => {
       resource,
     })).resolves.toMatchObject({
       allowed: true,
-      reason: "allow_issue_mention_grant",
+      reason: "allow_issue_comment_grant",
     });
     await expect(authorization.decide({
       actor,
       action: "issue:mutate",
       resource,
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+
+    const childIssue = await createIssue(db, company.id, {
+      title: "Ungrantable descendant",
+      projectId: targetProject.id,
+      assigneeAgentId: ownerAgent.id,
+      parentId: issue.id,
+    });
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource: { ...resource, issueId: childIssue.id, parentIssueId: issue.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+
+    const siblingIssue = await createIssue(db, company.id, {
+      title: "Ungrantable sibling",
+      projectId: targetProject.id,
+      assigneeAgentId: ownerAgent.id,
+    });
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource: { ...resource, issueId: siblingIssue.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+
+    await db.update(issueAgentCollaboratorGrants).set({
+      revokedAt: new Date(),
+      revokedByActorType: "agent",
+      revokedByActorId: ownerAgent.id,
+      updatedAt: new Date(),
+    }).where(eq(issueAgentCollaboratorGrants.id, grant.id));
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
-  it("allows a mentioned non-assignee to comment when the mention author is the issue assignee", async () => {
+  it("persists idempotent grant and revoke audit history", async () => {
+    const company = await createCompany(db, "CommentGrantAudit");
+    const ownerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const peerAgent = await createAgent(db, company.id, { role: "qa" });
+    const issue = await createIssue(db, company.id, {
+      title: "Audited comment grant",
+      assigneeAgentId: ownerAgent.id,
+    });
+    const service = issueCommentGrantService(db);
+    const actor = {
+      actorType: "agent" as const,
+      actorId: ownerAgent.id,
+      agentId: ownerAgent.id,
+    };
+
+    const created = await service.grant({
+      companyId: company.id,
+      issueId: issue.id,
+      agentId: peerAgent.id,
+      actor,
+    });
+    expect(created).toMatchObject({ kind: "ok", created: true });
+    const duplicate = await service.grant({
+      companyId: company.id,
+      issueId: issue.id,
+      agentId: peerAgent.id,
+      actor,
+    });
+    expect(duplicate).toMatchObject({
+      kind: "ok",
+      created: false,
+      grant: { id: created.kind === "ok" ? created.grant.id : "unexpected" },
+    });
+    expect(await service.listForIssue(company.id, issue.id)).toHaveLength(1);
+
+    const revoked = await service.revoke({
+      companyId: company.id,
+      issueId: issue.id,
+      agentId: peerAgent.id,
+      actor,
+    });
+    expect(revoked).toMatchObject({ revoked: true });
+    await expect(service.revoke({
+      companyId: company.id,
+      issueId: issue.id,
+      agentId: peerAgent.id,
+      actor,
+    })).resolves.toMatchObject({ revoked: false });
+    expect(await service.listForIssue(company.id, issue.id)).toHaveLength(0);
+    expect(await service.listForIssue(company.id, issue.id, true)).toEqual([
+      expect.objectContaining({ grant: expect.objectContaining({ revokedAt: expect.any(Date) }) }),
+    ]);
+
+    const otherCompany = await createCompany(db, "CommentGrantOtherCompany");
+    const outsideAgent = await createAgent(db, otherCompany.id, { role: "qa" });
+    await expect(service.grant({
+      companyId: company.id,
+      issueId: issue.id,
+      agentId: outsideAgent.id,
+      actor,
+    })).resolves.toEqual({ kind: "agent_not_found" });
+
+    const auditActions = await db.select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, created.kind === "ok" ? created.grant.id : "unexpected"));
+    expect(auditActions.map((row) => row.action)).toEqual([
+      "issue.comment_collaborator_granted",
+      "issue.comment_collaborator_revoked",
+    ]);
+  });
+
+  it("does not infer collaborator grants from assignee-authored mentions", async () => {
     const company = await createCompany(db, "MentionCommentAssigneeGrant");
     const allowedProject = await createProject(db, company.id, "MentionAssigneeAllowed");
     const targetProject = await createProject(db, company.id, "MentionAssigneeTarget");
@@ -1262,8 +1388,8 @@ describeEmbeddedPostgres("authorization service", () => {
         status: issue.status,
       },
     })).resolves.toMatchObject({
-      allowed: true,
-      reason: "allow_issue_mention_grant",
+      allowed: false,
+      reason: "deny_low_trust_boundary",
     });
   });
 
@@ -1330,7 +1456,7 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
-  it("allows active board-user comments to create mention-scoped issue grants", async () => {
+  it("does not infer collaborator grants from board-user mentions", async () => {
     const company = await createCompany(db, "MentionCommentBoardGrant");
     const allowedProject = await createProject(db, company.id, "MentionBoardAllowed");
     const targetProject = await createProject(db, company.id, "MentionBoardTarget");
@@ -1383,8 +1509,8 @@ describeEmbeddedPostgres("authorization service", () => {
       action: "issue:comment",
       resource,
     })).resolves.toMatchObject({
-      allowed: true,
-      reason: "allow_issue_mention_grant",
+      allowed: false,
+      reason: "deny_low_trust_boundary",
     });
   });
 

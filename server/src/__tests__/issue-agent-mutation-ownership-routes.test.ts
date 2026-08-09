@@ -77,6 +77,11 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   unlink: vi.fn(),
   listApprovalsForIssue: vi.fn(async () => []),
 }));
+const mockIssueCommentGrantService = vi.hoisted(() => ({
+  listForIssue: vi.fn(async () => []),
+  grant: vi.fn(),
+  revoke: vi.fn(),
+}));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
   listActiveForIssues: vi.fn(async () => new Map()),
@@ -159,6 +164,10 @@ function registerRouteMocks() {
 
   vi.doMock("../services/issues.js", () => ({
     issueService: () => mockIssueService,
+  }));
+
+  vi.doMock("../services/issue-comment-grants.js", () => ({
+    issueCommentGrantService: () => mockIssueCommentGrantService,
   }));
 
   vi.doMock("../services/work-products.js", () => ({
@@ -368,6 +377,7 @@ describe("agent issue mutation checkout ownership", () => {
     vi.doUnmock("../services/external-objects.js");
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../services/issues.js");
+    vi.doUnmock("../services/issue-comment-grants.js");
     vi.doUnmock("../services/work-products.js");
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
@@ -493,6 +503,19 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueApprovalService.unlink.mockReset();
     mockIssueApprovalService.listApprovalsForIssue.mockReset();
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
+    mockIssueCommentGrantService.listForIssue.mockReset();
+    mockIssueCommentGrantService.listForIssue.mockResolvedValue([]);
+    mockIssueCommentGrantService.grant.mockReset();
+    mockIssueCommentGrantService.grant.mockResolvedValue({
+      kind: "ok",
+      created: true,
+      grant: { id: recoveryActionId, granteeAgentId: peerAgentId, capability: "comment:create" },
+    });
+    mockIssueCommentGrantService.revoke.mockReset();
+    mockIssueCommentGrantService.revoke.mockResolvedValue({
+      revoked: true,
+      grant: { id: recoveryActionId, granteeAgentId: peerAgentId, capability: "comment:create" },
+    });
     mockIssueThreadInteractionService.listForIssue.mockReset();
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueService.remove.mockReset();
@@ -767,14 +790,14 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
   });
 
-  it("allows mentioned peer agents to post comments without ownership of an active checkout", async () => {
+  it("allows explicitly granted peer agents to post comments without issue mutation", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:comment",
       action: input.action,
-      reason: input.action === "issue:comment" ? "allow_issue_mention_grant" : "deny_missing_grant",
+      reason: input.action === "issue:comment" ? "allow_issue_comment_grant" : "deny_missing_grant",
       explanation:
         input.action === "issue:comment"
-          ? "Allowed by a mention-scoped issue comment grant."
+          ? "Allowed by an issue-scoped comment collaborator grant."
           : "Missing permission.",
     }));
 
@@ -790,6 +813,74 @@ describe("agent issue mutation checkout ownership", () => {
       expect.any(Object),
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("lets an issue owner grant and revoke one peer's comment capability", async () => {
+    const app = await createApp(ownerActor());
+
+    const granted = await request(app)
+      .post(`/api/issues/${issueId}/collaborator-grants`)
+      .send({ agentId: peerAgentId });
+    expect(granted.status, JSON.stringify(granted.body)).toBe(201);
+    expect(mockIssueCommentGrantService.grant).toHaveBeenCalledWith(expect.objectContaining({
+      companyId,
+      issueId,
+      agentId: peerAgentId,
+      actor: expect.objectContaining({ actorType: "agent", actorId: ownerAgentId, runId: ownerRunId }),
+    }));
+
+    const revoked = await request(app)
+      .delete(`/api/issues/${issueId}/collaborator-grants/${peerAgentId}`);
+    expect(revoked.status, JSON.stringify(revoked.body)).toBe(200);
+    expect(mockIssueCommentGrantService.revoke).toHaveBeenCalledWith(expect.objectContaining({
+      companyId,
+      issueId,
+      agentId: peerAgentId,
+    }));
+  });
+
+  it("does not let a comment-granted peer delegate or revoke collaborator grants", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment",
+      action: input.action,
+      reason: input.action === "issue:comment" ? "allow_issue_comment_grant" : "deny_missing_grant",
+      explanation: input.action === "issue:comment" ? "Comment-only grant." : "Missing permission.",
+    }));
+    const app = await createApp(peerActor());
+
+    await request(app)
+      .post(`/api/issues/${issueId}/collaborator-grants`)
+      .send({ agentId: ownerAgentId })
+      .expect(403);
+    await request(app)
+      .delete(`/api/issues/${issueId}/collaborator-grants/${ownerAgentId}`)
+      .expect(403);
+
+    expect(mockIssueCommentGrantService.grant).not.toHaveBeenCalled();
+    expect(mockIssueCommentGrantService.revoke).not.toHaveBeenCalled();
+  });
+
+  it("does not let a comment grant carry lifecycle or interaction-resolution intent", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment",
+      action: input.action,
+      reason: input.action === "issue:comment" ? "allow_issue_comment_grant" : "deny_missing_grant",
+      explanation: input.action === "issue:comment" ? "Comment-only grant." : "Missing permission.",
+    }));
+    const app = await createApp(peerActor());
+
+    const resume = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Please resume.", resume: true });
+    expect(resume.status, JSON.stringify(resume.body)).toBe(403);
+    expect(resume.body.error).toBe("Issue comment collaborator grant authorizes comment creation only");
+
+    const accept = await request(app)
+      .post(`/api/issues/${issueId}/interactions/${recoveryActionId}/accept`)
+      .send({});
+    expect(accept.status, JSON.stringify(accept.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
   it("rejects non-mentioned peer agents from posting comments", async () => {
@@ -842,14 +933,14 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueThreadInteractionService.listForIssue).not.toHaveBeenCalled();
   });
 
-  it("allows mentioned peer agents to list comments through an issue read grant", async () => {
+  it("allows peers with a separate issue read grant to list comments", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:read",
       action: input.action,
-      reason: input.action === "issue:read" ? "allow_issue_mention_grant" : "deny_missing_grant",
+      reason: input.action === "issue:read" ? "allow_explicit_grant" : "deny_missing_grant",
       explanation:
         input.action === "issue:read"
-          ? "Allowed by a mention-scoped issue comment grant."
+          ? "Allowed by a separate issue read grant."
           : "Missing permission.",
     }));
 
@@ -888,20 +979,20 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.getComment).not.toHaveBeenCalled();
   });
 
-  it("keeps true issue mutations denied for mentioned peer agents", async () => {
+  it("keeps true issue mutations denied for comment-granted peer agents", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:comment" || input.action === "issue:mutate",
       action: input.action,
       reason:
         input.action === "issue:comment"
-          ? "allow_issue_mention_grant"
+          ? "allow_issue_comment_grant"
           : input.action === "issue:mutate"
             ? "allow_explicit_grant"
             : "deny_missing_grant",
       explanation:
         input.action === "issue:comment"
-          ? "Allowed by a mention-scoped issue comment grant."
+          ? "Allowed by an issue-scoped comment collaborator grant."
           : input.action === "issue:mutate"
             ? "Allowed by test boundary default."
             : "Missing permission.",

@@ -450,7 +450,7 @@ Operational policy:
 
 The current implementation includes additional V1-control-plane tables beyond the original February snapshot:
 
-- Issue structure and review: `issue_relations` for blockers, `labels`/`issue_labels`, `issue_thread_interactions`, `issue_approvals`, `issue_execution_decisions`, `issue_work_products`, `issue_inbox_archives`, `issue_read_states`, and issue reference mention indexes.
+- Issue structure and review: `issue_relations` for blockers, `labels`/`issue_labels`, `issue_thread_interactions`, `issue_approvals`, `issue_execution_decisions`, `issue_work_products`, `issue_inbox_archives`, `issue_read_states`, `issue_agent_collaborator_grants`, and issue reference mention indexes. Collaborator grants retain grant/revoke actor and run provenance; the only supported capability is `comment:create`.
 - Execution and workspace control: `execution_workspaces`, `project_workspaces`, `workspace_runtime_services`, `workspace_operations`, `environments`, `environment_leases`, `agent_task_sessions`, `agent_runtime_state`, `agent_wakeup_requests`, heartbeat events, and watchdog decision tables.
 - Plugins and routines: `plugins`, plugin config/state/entities/jobs/logs/webhooks, plugin database namespaces/migrations, plugin company settings, `routines`, `routine_revisions`, `routine_triggers`, and `routine_runs`.
 - Access and operations: company memberships, instance roles, principal permission grants, invites, join requests, board API keys, CLI auth challenges, budget policies/incidents, feedback exports/votes, company skills, sidebar preferences, and company logos.
@@ -545,7 +545,16 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
 | Set subordinate budget | yes | yes (manager subtree only) |
 | Manage responsible user's inbox state | yes | yes (default-open policy) |
 | Manage another user's inbox state | yes | scoped `inbox:manage` grant |
+| Grant/revoke issue comment collaborator | yes | yes, only with pre-existing write authority on that issue |
 | Set work-object visibility (issue/project) | no | no (pro gate) |
+
+### 9.3.1 Issue Comment Collaborator Grants
+
+An issue writer may explicitly solicit one named peer agent's comment on that issue. The persisted grant is scoped by company, issue, grantee agent, and the fixed `comment:create` capability. It is idempotent, auditable, and revocable.
+
+The grant permits only `POST /issues/:issueId/comments`. It does not permit issue reads that the actor could not already perform, issue PATCH/status/reassignment, comment lifecycle flags (`resume`, `reopen`, or `interrupt`), interaction creation or resolution, descendant access, sibling access, or access to any other issue. A grantee cannot delegate or revoke grants using comment-only authority. Free-text mentions, including `agent://` links, never create authorization.
+
+Grant and revoke operations require the caller's pre-existing issue write authority. Existing assignee, unassigned-issue, manager-ancestor, and board write behavior remains unchanged. Grant/revoke rows and `activity_log` events retain actor, run, issue, grantee, capability, and timestamps.
 
 ## 9.4 Permission Terminology and Default Visibility Rule
 
@@ -858,6 +867,9 @@ All endpoints are under `/api` and return JSON.
 - `POST /issues/:issueId/admin/force-release` (board-only lock recovery)
 - `POST /issues/:issueId/comments`
 - `GET /issues/:issueId/comments`
+- `GET /issues/:issueId/collaborator-grants` (`includeRevoked=true` includes history)
+- `POST /issues/:issueId/collaborator-grants` with `{ "agentId": "uuid" }`
+- `DELETE /issues/:issueId/collaborator-grants/:agentId`
 - `POST /companies/:companyId/issues/:issueId/attachments` (multipart upload)
 - `GET /issues/:issueId/attachments`
 - `GET /attachments/:attachmentId/content`
@@ -946,6 +958,7 @@ Dashboard payload must include:
 The current app also exposes V1-supporting surfaces for:
 
 - issue thread interactions (`suggest_tasks`, `ask_user_questions`, `request_confirmation`)
+- explicit issue-scoped comment collaborator grants; see `doc/ISSUE-COMMENT-COLLABORATORS.md`
 - issue approvals, issue references/search, labels, read state, inbox/archive state, and work products
 - company search through `GET /companies/:companyId/search` plus agent-oriented bulk extraction through
   `GET /companies/:companyId/search/extract`; extraction accepts a server-escaped literal `contains`, optional

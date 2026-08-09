@@ -192,11 +192,15 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import { issueCommentGrantService } from "../services/issue-comment-grants.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+const issueCommentGrantBodySchema = z.object({
+  agentId: z.string().uuid(),
+}).strict();
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();
@@ -2594,6 +2598,7 @@ export function issueRoutes(
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
+  const issueCommentGrantsSvc = issueCommentGrantService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
@@ -3461,8 +3466,35 @@ export function issueRoutes(
     return boundaryDecision;
   }
 
-  function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
-    return decision !== true && decision.reason === "allow_issue_mention_grant";
+  function isIssueCommentGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && decision.reason === "allow_issue_comment_grant";
+  }
+
+  async function assertIssueCommentGrantManagementAllowed(
+    req: Request,
+    res: Response,
+    issue: Parameters<typeof decideIssueAccess>[1],
+  ) {
+    if (req.actor.type === "board") return true;
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      res.status(403).json({ error: "Issue comment collaborator grants require an authorized agent or board user" });
+      return false;
+    }
+    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (watchdogScope.kind !== "none") {
+      res.status(403).json({ error: "Task-watchdog scope does not authorize collaborator grant management" });
+      return false;
+    }
+    const decision = await decideIssueAccess(req, issue, "issue:comment");
+    if (decision.allowed && !isIssueCommentGrantDecision(decision)) return true;
+    if (
+      issue.assigneeAgentId &&
+      await hasActiveCheckoutManagementOverride(req.actor.agentId, issue.companyId, issue.assigneeAgentId)
+    ) {
+      return true;
+    }
+    res.status(403).json({ error: "Actor is not authorized to manage comment collaborators for this issue" });
+    return false;
   }
 
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
@@ -9432,6 +9464,70 @@ export function issueRoutes(
     },
   );
 
+  router.get("/issues/:id/collaborator-grants", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const grants = await issueCommentGrantsSvc.listForIssue(
+      issue.companyId,
+      issue.id,
+      parseBooleanQuery(req.query.includeRevoked),
+    );
+    res.json(grants);
+  });
+
+  router.post(
+    "/issues/:id/collaborator-grants",
+    validate(issueCommentGrantBodySchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (!(await assertIssueCommentGrantManagementAllowed(req, res, issue))) return;
+      const actor = getActorInfo(req);
+      if (actor.actorType !== "agent" && actor.actorType !== "user") {
+        res.status(403).json({ error: "Authenticated agent or board user required" });
+        return;
+      }
+      const result = await issueCommentGrantsSvc.grant({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        agentId: req.body.agentId,
+        actor,
+      });
+      if (result.kind === "agent_not_found") {
+        res.status(404).json({ error: "Agent not found in issue company" });
+        return;
+      }
+      res.status(result.created ? 201 : 200).json(result);
+    },
+  );
+
+  router.delete("/issues/:id/collaborator-grants/:agentId", async (req, res) => {
+    const id = req.params.id as string;
+    const agentId = z.string().uuid().safeParse(req.params.agentId);
+    if (!agentId.success) {
+      res.status(400).json({ error: "Valid agent id required" });
+      return;
+    }
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueCommentGrantManagementAllowed(req, res, issue))) return;
+    const actor = getActorInfo(req);
+    if (actor.actorType !== "agent" && actor.actorType !== "user") {
+      res.status(403).json({ error: "Authenticated agent or board user required" });
+      return;
+    }
+    const result = await issueCommentGrantsSvc.revoke({
+      companyId: issue.companyId,
+      issueId: issue.id,
+      agentId: agentId.data,
+      actor,
+    });
+    res.json(result);
+  });
+
   router.get("/issues/:id/comments/:commentId", async (req, res) => {
     const id = req.params.id as string;
     const commentId = req.params.commentId as string;
@@ -9688,22 +9784,24 @@ export function issueRoutes(
     const interruptRequested = req.body.interrupt === true;
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
-    const mentionGrantedPeerAgentCommentOnly =
-      isClosed &&
+    const collaboratorGrantCommentOnly =
       req.actor.type === "agent" &&
-      issue.assigneeAgentId !== null &&
-      issue.assigneeAgentId !== req.actor.agentId &&
-      !reopenRequested &&
-      !resumeRequested &&
-      isIssueMentionGrantDecision(commentAccessDecision);
-    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
-    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+      isIssueCommentGrantDecision(commentAccessDecision);
+    if (collaboratorGrantCommentOnly && (reopenRequested || resumeRequested || interruptRequested)) {
+      res.status(403).json({
+        error: "Issue comment collaborator grant authorizes comment creation only",
+        details: { capability: "comment:create" },
+      });
+      return;
+    }
+    const effectiveReopenRequested = collaboratorGrantCommentOnly ? false : reopenRequested;
+    const effectiveResumeRequested = collaboratorGrantCommentOnly ? false : resumeRequested;
     if (
       isClosed &&
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
-      !mentionGrantedPeerAgentCommentOnly
+      !collaboratorGrantCommentOnly
     ) {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     }
@@ -9733,6 +9831,7 @@ export function issueRoutes(
       actorId: actor.actorId,
     });
     const effectiveMoveToTodoRequested =
+      !collaboratorGrantCommentOnly &&
       !assigneeSelfCommentOnTerminal &&
       (explicitMoveToTodoRequested ||
         shouldImplicitlyMoveCommentedIssueToTodo({
@@ -9852,6 +9951,7 @@ export function issueRoutes(
     const currentExecutionState = parseIssueExecutionState(currentIssue.executionState);
     const currentExecutionPolicy = normalizeIssueExecutionPolicy(currentIssue.executionPolicy ?? null);
     const shouldAutoApproveReviewComment =
+      !collaboratorGrantCommentOnly &&
       currentIssue.status === "in_review" &&
       currentExecutionState?.status === "pending" &&
       actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
@@ -10015,6 +10115,9 @@ export function issueRoutes(
         bodySnippet: comment.body.slice(0, 120),
         identifier: currentIssue.identifier,
         issueTitle: currentIssue.title,
+        ...(collaboratorGrantCommentOnly
+          ? { authorizationReason: "allow_issue_comment_grant", capability: "comment:create" }
+          : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
         ...(scheduledRetrySupersededByComment

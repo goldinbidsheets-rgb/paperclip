@@ -100,6 +100,11 @@ export {
   type PrincipalAccessCompatibilityBackfillStats,
 } from "./principal-access-compatibility.js";
 export { authorizationService } from "./authorization.js";
+export {
+  hasActiveIssueCommentGrant,
+  ISSUE_COMMENT_COLLABORATOR_CAPABILITY,
+  issueCommentGrantService,
+} from "./issue-comment-grants.js";
 export { inboxAgentPolicyService } from "./inbox-agent-policy.js";
 export type {
   AuthorizationAction,

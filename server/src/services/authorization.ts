@@ -6,7 +6,6 @@ import {
   companyMemberships,
   heartbeatRuns,
   instanceUserRoles,
-  issueComments,
   issues,
   principalPermissionGrants,
   projects,
@@ -20,7 +19,7 @@ import type {
   SkillTestAgentKeyScope,
   TaskBridgeAgentKeyScope,
 } from "@paperclipai/shared";
-import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, type LowTrustBoundary } from "@paperclipai/shared";
+import { LOW_TRUST_REVIEW_PRESET, type LowTrustBoundary } from "@paperclipai/shared";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
   isIssueWithinLowTrustBoundary,
@@ -28,6 +27,7 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
+import { hasActiveIssueCommentGrant } from "./issue-comment-grants.js";
 
 export type AuthorizationActor =
   {
@@ -101,7 +101,7 @@ export type AuthorizationDecision = {
     | "allow_direct_change"
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
-    | "allow_issue_mention_grant"
+    | "allow_issue_comment_grant"
     | "allow_self"
     | "allow_company_agent"
     | "allow_company_member"
@@ -966,17 +966,15 @@ export function authorizationService(db: Db) {
         return lowTrustAllow("Allowed inside the low-trust issue boundary.");
       }
       if (
-        input.action !== "issue:mutate" &&
+        input.action === "issue:comment" &&
         input.resource.issueId &&
-        await agentHasMentionGrantOnIssue({
-          action: input.action,
+        await hasActiveIssueCommentGrant(db, {
           companyId: boundary.companyId,
           issueId: input.resource.issueId,
-          issueAssigneeAgentId: input.resource.assigneeAgentId ?? null,
-          actorAgentId: input.actorAgentId,
+          agentId: input.actorAgentId,
         })
       ) {
-        return allowIssueMentionGrant(input.action);
+        return allowIssueCommentGrant();
       }
       return lowTrustDeny("Issue is outside this low-trust boundary.");
     }
@@ -1235,90 +1233,11 @@ export function authorizationService(db: Db) {
     return isAgentInSubtree(db, companyId, managerAgentId, assigneeAgentId);
   }
 
-  function commentAuthorCanGrantIssueMention(input: {
-    mentionedAgentId: string;
-    issueAssigneeAgentId: string | null;
-    authorAgentId: string | null;
-    authorUserId: string | null;
-    activeAuthorUserIds: Set<string>;
-  }) {
-    if (input.authorAgentId) {
-      if (input.authorAgentId === input.mentionedAgentId) return false;
-      return input.issueAssigneeAgentId === input.authorAgentId;
-    }
-    if (input.authorUserId) {
-      return input.activeAuthorUserIds.has(input.authorUserId);
-    }
-    return false;
-  }
-
-  async function agentHasMentionGrantOnIssue(input: {
-    action: AuthorizationAction;
-    companyId: string;
-    issueId: string;
-    issueAssigneeAgentId: string | null;
-    actorAgentId: string;
-  }) {
-    const rows = await db
-      .select({
-        id: issueComments.id,
-        body: issueComments.body,
-        authorAgentId: issueComments.authorAgentId,
-        authorUserId: issueComments.authorUserId,
-      })
-      .from(issueComments)
-      .where(and(
-        eq(issueComments.companyId, input.companyId),
-        eq(issueComments.issueId, input.issueId),
-        isNull(issueComments.deletedAt),
-        sql`${issueComments.body} LIKE ${"%agent://" + input.actorAgentId + "%"}`,
-      ));
-
-    const mentionRows = rows.filter((row) => extractAgentMentionIds(row.body).includes(input.actorAgentId));
-    const authorUserIds = [...new Set(mentionRows.flatMap((row) => row.authorUserId ? [row.authorUserId] : []))];
-    const activeAuthorUserIds = new Set(
-      authorUserIds.length === 0
-        ? []
-        : await db
-          .select({ principalId: companyMemberships.principalId })
-          .from(companyMemberships)
-          .where(and(
-            eq(companyMemberships.companyId, input.companyId),
-            eq(companyMemberships.principalType, "user"),
-            eq(companyMemberships.status, "active"),
-            inArray(companyMemberships.principalId, authorUserIds),
-          ))
-          .then((memberships) => memberships.map((membership) => membership.principalId)),
-    );
-
-    for (const row of mentionRows) {
-      const authorCanGrant = commentAuthorCanGrantIssueMention({
-        mentionedAgentId: input.actorAgentId,
-        issueAssigneeAgentId: input.issueAssigneeAgentId,
-        authorAgentId: row.authorAgentId,
-        authorUserId: row.authorUserId,
-        activeAuthorUserIds,
-      });
-      if (authorCanGrant) {
-        logger.info({
-          actorAgentId: input.actorAgentId,
-          issueId: input.issueId,
-          companyId: input.companyId,
-          commentId: row.id,
-          grantedAction: input.action,
-          grant: "issue_mention_comment",
-        }, "authorized issue mention-scoped comment grant");
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function allowIssueMentionGrant(action: AuthorizationAction): AuthorizationDecision {
+  function allowIssueCommentGrant(): AuthorizationDecision {
     return allow({
-      action,
-      reason: "allow_issue_mention_grant",
-      explanation: "Allowed by a mention-scoped issue comment grant.",
+      action: "issue:comment",
+      reason: "allow_issue_comment_grant",
+      explanation: "Allowed by an active issue-scoped comment collaborator grant.",
     });
   }
 
@@ -1892,15 +1811,13 @@ export function authorizationService(db: Db) {
       if (
         input.action === "issue:comment" &&
         resource?.issueId &&
-        await agentHasMentionGrantOnIssue({
-          action: input.action,
+        await hasActiveIssueCommentGrant(db, {
           companyId,
           issueId: resource.issueId,
-          issueAssigneeAgentId: resource.assigneeAgentId ?? null,
-          actorAgentId,
+          agentId: actorAgentId,
         })
       ) {
-        return allowIssueMentionGrant(input.action);
+        return allowIssueCommentGrant();
       }
     }
     if (
