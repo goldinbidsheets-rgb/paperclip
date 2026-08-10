@@ -1,3 +1,5 @@
+import express from "express";
+import request from "supertest";
 import type { NextFunction, Request, Response } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
@@ -32,6 +34,36 @@ describe("errorHandler", () => {
   beforeEach(() => {
     recordResponsibleUserDenialOnActiveRunMock.mockReset();
     recordResponsibleUserDenialOnActiveRunMock.mockResolvedValue(null);
+  });
+
+  it("returns a clear 400 for malformed JSON before an issue PATCH", async () => {
+    const app = express();
+    app.use(express.json());
+    app.patch("/api/issues/:id", (_req, res) => res.status(204).end());
+    app.use(errorHandler);
+
+    const response = await request(app)
+      .patch("/api/issues/issue-1")
+      .set("Content-Type", "application/json")
+      .send('{"status":"todo"');
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: "Invalid JSON request body",
+      code: "invalid_json_body",
+      remediation: "Send a syntactically valid JSON object with Content-Type: application/json.",
+    });
+  });
+
+  it("does not reclassify unrelated syntax errors as malformed request JSON", () => {
+    const req = makeReq();
+    const res = makeRes();
+    const next = vi.fn() as unknown as NextFunction;
+
+    errorHandler(new SyntaxError("application bug"), req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
   });
 
   it("attaches the original Error to res.err for 500s", () => {

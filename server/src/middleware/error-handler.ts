@@ -23,6 +23,18 @@ function isRedactedSkillPolicyDenial(details: Record<string, unknown> | null) {
   return details?.code === "skill_policy_denied";
 }
 
+function isMalformedJsonBodyError(err: unknown) {
+  if (!(err instanceof SyntaxError)) return false;
+
+  const bodyParserError = err as SyntaxError & {
+    status?: unknown;
+    statusCode?: unknown;
+    type?: unknown;
+  };
+  return bodyParserError.type === "entity.parse.failed"
+    && (bodyParserError.status === 400 || bodyParserError.statusCode === 400);
+}
+
 function attachErrorContext(
   req: Request,
   res: Response,
@@ -78,6 +90,15 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  if (isMalformedJsonBodyError(err)) {
+    res.status(400).json({
+      error: "Invalid JSON request body",
+      code: "invalid_json_body",
+      remediation: "Send a syntactically valid JSON object with Content-Type: application/json.",
+    });
+    return;
+  }
+
   if (err instanceof HttpError) {
     const details = err.details && typeof err.details === "object" && !Array.isArray(err.details)
       ? err.details as Record<string, unknown>

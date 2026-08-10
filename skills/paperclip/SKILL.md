@@ -136,6 +136,28 @@ Done
 MD
 ```
 
+On Windows PowerShell, use `curl.exe` and stream generated JSON through stdin so native-argument quoting cannot corrupt the body. This recovery example moves the current issue from `blocked` to `todo`, then immediately reads it back:
+
+```powershell
+$paperclipApiBase = $env:PAPERCLIP_API_URL.TrimEnd('/')
+if ($paperclipApiBase.EndsWith('/api')) {
+  $paperclipApiBase = $paperclipApiBase.Substring(0, $paperclipApiBase.Length - 4)
+}
+
+@{ status = 'todo' } |
+  ConvertTo-Json -Compress |
+  curl.exe -sS --fail-with-body -X PATCH `
+    -H "Authorization: Bearer $env:PAPERCLIP_API_KEY" `
+    -H "Content-Type: application/json" `
+    -H "X-Paperclip-Run-Id: $env:PAPERCLIP_RUN_ID" `
+    --data-binary '@-' `
+    "$paperclipApiBase/api/issues/$env:PAPERCLIP_TASK_ID"
+
+curl.exe -sS --fail-with-body `
+  -H "Authorization: Bearer $env:PAPERCLIP_API_KEY" `
+  "$paperclipApiBase/api/issues/$env:PAPERCLIP_TASK_ID"
+```
+
 Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`, `cancelled`. Priority values: `critical`, `high`, `medium`, `low`. Other updatable fields: `title`, `description`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`, `blockedByIssueIds`.
 
 ### Status Quick Guide
