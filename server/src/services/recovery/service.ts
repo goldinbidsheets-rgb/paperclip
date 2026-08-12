@@ -3853,6 +3853,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
+      if (
+        issue.status === "todo" &&
+        await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id)
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
       const agent = await getAgent(agentId);
       const agentInvokable = agent && agent.companyId === issue.companyId
         ? await isAgentInvokable(agent)
