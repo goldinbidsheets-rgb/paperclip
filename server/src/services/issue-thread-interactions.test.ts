@@ -1,6 +1,5 @@
 import { getTableName } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getTableName } from "drizzle-orm";
 
 const mockCreateChild = vi.fn();
 
