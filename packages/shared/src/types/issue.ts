@@ -986,7 +986,7 @@ export interface SuggestTasksResultCreatedTask {
 
 export interface SuggestTasksResult {
   version: 1;
-  outcome?: "issue_closed";
+  outcome?: "withdrawn" | "issue_closed";
   reason?: string | null;
   createdTasks?: SuggestTasksResultCreatedTask[];
   skippedClientKeys?: string[];
@@ -1024,7 +1024,7 @@ export interface AskUserQuestionsAnswer {
 
 export interface AskUserQuestionsResult {
   version: 1;
-  outcome?: "issue_closed";
+  outcome?: "withdrawn" | "issue_closed";
   reason?: string | null;
   answers: AskUserQuestionsAnswer[];
   cancelled?: true;
@@ -1160,7 +1160,7 @@ export interface RequestItemVerdictsPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "issue_closed";
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "withdrawn" | "issue_closed";
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
@@ -1192,7 +1192,7 @@ export interface RequestItemVerdictsResultItem {
 
 export interface RequestItemVerdictsResult {
   version: 1;
-  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled" | "issue_closed";
+  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled" | "withdrawn" | "issue_closed";
   reason?: string | null;
   complete: boolean;
   items: RequestItemVerdictsResultItem[];
