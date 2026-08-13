@@ -37,10 +37,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 
 COPY --from=shim-build   /out/paperclip-agent-shim                          /usr/local/bin/paperclip-agent-shim
 COPY --chmod=0755 docker/agent-runtime/timezone-canary.sh                    /usr/local/bin/paperclip-timezone-canary
+COPY --chmod=0755 docker/agent-runtime/tests/timezone-canary.test.sh         /tmp/timezone-canary.test.sh
 
 # Fail the image build if the platform timezone database cannot resolve both
 # sides of the America/New_York daylight-saving boundary.
-RUN /usr/local/bin/paperclip-timezone-canary
+RUN /tmp/timezone-canary.test.sh /usr/local/bin/paperclip-timezone-canary \
+    && rm /tmp/timezone-canary.test.sh
 
 USER 1000:1000
 WORKDIR /workspace
