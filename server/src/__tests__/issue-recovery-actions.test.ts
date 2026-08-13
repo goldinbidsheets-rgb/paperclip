@@ -328,6 +328,119 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("does not escalate a stale source snapshot after the issue reaches a terminal status", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const completedAt = new Date("2026-08-12T22:31:54.000Z");
+    await db
+      .update(issues)
+      .set({
+        status: "done",
+        completedAt,
+        updatedAt: completedAt,
+      })
+      .where(eq(issues.id, sourceIssue.id));
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "cancelled",
+      error: "Issue is already terminal",
+      errorCode: "issue_terminal_status",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    const result = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Stale continuation recovery failed.",
+    });
+
+    expect(result).toBeNull();
+    const [unchangedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(unchangedIssue).toMatchObject({
+      status: "done",
+      assigneeAgentId: coderId,
+      completedAt,
+    });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(await db.select().from(issueComments)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not escalate when the source reaches a terminal status during recovery", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const completedAt = new Date("2026-08-12T22:31:54.000Z");
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    let releaseTerminalWrite!: () => void;
+    const terminalWriteRelease = new Promise<void>((resolve) => {
+      releaseTerminalWrite = resolve;
+    });
+    let terminalWriteLocked!: () => void;
+    const terminalWriteLock = new Promise<void>((resolve) => {
+      terminalWriteLocked = resolve;
+    });
+    const terminalWrite = db.transaction(async (tx) => {
+      await tx
+        .update(issues)
+        .set({ status: "done", completedAt, updatedAt: completedAt })
+        .where(eq(issues.id, sourceIssue.id));
+      terminalWriteLocked();
+      await terminalWriteRelease;
+    });
+    await terminalWriteLock;
+
+    const escalation = recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "cancelled",
+        error: "Issue is already terminal",
+        errorCode: "issue_terminal_status",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+      },
+      comment: "Concurrent continuation recovery failed.",
+    });
+
+    try {
+      await vi.waitFor(async () => {
+        const actions = await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+        expect(actions).toHaveLength(1);
+      });
+    } finally {
+      releaseTerminalWrite();
+    }
+    await terminalWrite;
+
+    const result = await escalation;
+    expect(result).toBeNull();
+    const [unchangedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(unchangedIssue).toMatchObject({
+      status: "done",
+      assigneeAgentId: coderId,
+      completedAt,
+    });
+    const [recoveryAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(recoveryAction).toMatchObject({
+      status: "cancelled",
+      outcome: "false_positive",
+    });
+    expect(await db.select().from(issueComments)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["process_lost", undefined, "coder"],
     ["adapter_failed", "successful_run_missing_state", "coder"],

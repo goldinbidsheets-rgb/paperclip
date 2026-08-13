@@ -3151,6 +3151,62 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    const candidateIssue = input.issue;
+    const liveIssue = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.id, candidateIssue.id),
+          eq(issues.companyId, candidateIssue.companyId),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const liveIssueDrifted = Boolean(
+      liveIssue && (
+        liveIssue.status !== input.previousStatus ||
+        liveIssue.assigneeAgentId !== candidateIssue.assigneeAgentId ||
+        liveIssue.assigneeUserId !== candidateIssue.assigneeUserId
+      ),
+    );
+    if (!liveIssue || isTerminalIssueStatus(liveIssue.status)) {
+      logger.warn({
+        sourceIssueId: candidateIssue.id,
+        candidateStatus: input.previousStatus,
+        liveStatus: liveIssue?.status ?? null,
+        candidateAssigneeAgentId: candidateIssue.assigneeAgentId,
+        liveAssigneeAgentId: liveIssue?.assigneeAgentId ?? null,
+        candidateAssigneeUserId: candidateIssue.assigneeUserId,
+        liveAssigneeUserId: liveIssue?.assigneeUserId ?? null,
+        latestRunId: input.latestRun?.id ?? null,
+        latestRunStatus: input.latestRun?.status ?? null,
+        latestRunErrorCode: input.latestRun?.errorCode ?? null,
+      }, "skipped stranded issue escalation after live source revalidation changed");
+      return null;
+    }
+    if (liveIssueDrifted) {
+      logger.warn({
+        sourceIssueId: candidateIssue.id,
+        candidateStatus: input.previousStatus,
+        liveStatus: liveIssue.status,
+        candidateAssigneeAgentId: candidateIssue.assigneeAgentId,
+        liveAssigneeAgentId: liveIssue.assigneeAgentId,
+        candidateAssigneeUserId: candidateIssue.assigneeUserId,
+        liveAssigneeUserId: liveIssue.assigneeUserId,
+        latestRunId: input.latestRun?.id ?? null,
+        latestRunStatus: input.latestRun?.status ?? null,
+        latestRunErrorCode: input.latestRun?.errorCode ?? null,
+      }, "continuing stranded issue escalation after non-terminal source drift");
+    }
+    if (!liveIssueDrifted) {
+      input = {
+        ...input,
+        issue: liveIssue,
+        previousStatus: liveIssue.status as StrandedPreviousStatus,
+      };
+    }
+
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -3171,22 +3227,99 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const isProviderQuotaWait = recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
       Boolean(recoveryAction.returnOwnerAgentId);
-    if (isProviderQuotaWait && recoveryAction.returnOwnerAgentId) {
-      await ensureProviderQuotaWaitRecoveryMonitor({
-        issue: input.issue,
-        latestRun: input.latestRun,
-        actionId: recoveryAction.id,
-        agentId: recoveryAction.returnOwnerAgentId,
-      });
-    }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+    const updateAttempt = await db.transaction(async (tx) => {
+      await tx.execute(sql`
+        select ${issues.id} from ${issues}
+        where ${and(
+          eq(issues.id, input.issue.id),
+          eq(issues.companyId, input.issue.companyId),
+        )}
+        for update
+      `);
+      const currentIssue = await tx
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.id, input.issue.id),
+            eq(issues.companyId, input.issue.companyId),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!currentIssue || isTerminalIssueStatus(currentIssue.status)) {
+        return { updated: null, currentIssue };
+      }
+      if (
+        !liveIssueDrifted &&
+        (
+          currentIssue.status !== input.previousStatus ||
+          currentIssue.assigneeAgentId !== input.issue.assigneeAgentId ||
+          currentIssue.assigneeUserId !== input.issue.assigneeUserId
+        )
+      ) {
+        logger.warn({
+          sourceIssueId: input.issue.id,
+          candidateStatus: input.previousStatus,
+          liveStatus: currentIssue.status,
+          candidateAssigneeAgentId: input.issue.assigneeAgentId,
+          liveAssigneeAgentId: currentIssue.assigneeAgentId,
+          candidateAssigneeUserId: input.issue.assigneeUserId,
+          liveAssigneeUserId: currentIssue.assigneeUserId,
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          recoveryActionId: recoveryAction.id,
+        }, "continuing stranded issue escalation after non-terminal source drift");
+      }
+      const updated = await issuesSvc.update(input.issue.id, {
+        status: "blocked",
+        blockedByIssueIds: blockerIds,
+        assigneeAgentId: recoveryAction.ownerAgentId ?? currentIssue.assigneeAgentId,
+      }, tx);
+      return { updated, currentIssue };
     });
-    if (!updated) return null;
-    if (isProviderQuotaWait) return updated;
+    const updated = updateAttempt.updated;
+    if (!updated) {
+      const currentIssue = updateAttempt.currentIssue;
+      if (currentIssue && isTerminalIssueStatus(currentIssue.status)) {
+        await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: input.issue.companyId,
+          sourceIssueId: input.issue.id,
+          actionId: recoveryAction.id,
+          status: "cancelled",
+          outcome: "false_positive",
+          resolutionNote:
+            `Recovery escalation became stale because the source issue reached terminal status ${currentIssue.status}.`,
+        });
+      }
+      logger.warn({
+        sourceIssueId: input.issue.id,
+        candidateStatus: input.previousStatus,
+        liveStatus: currentIssue?.status ?? null,
+        candidateAssigneeAgentId: input.issue.assigneeAgentId,
+        liveAssigneeAgentId: currentIssue?.assigneeAgentId ?? null,
+        candidateAssigneeUserId: input.issue.assigneeUserId,
+        liveAssigneeUserId: currentIssue?.assigneeUserId ?? null,
+        latestRunId: input.latestRun?.id ?? null,
+        latestRunStatus: input.latestRun?.status ?? null,
+        latestRunErrorCode: input.latestRun?.errorCode ?? null,
+        recoveryActionId: recoveryAction.id,
+      }, "aborted stranded issue escalation after locked source revalidation changed");
+      return null;
+    }
+    if (isProviderQuotaWait) {
+      if (recoveryAction.returnOwnerAgentId) {
+        await ensureProviderQuotaWaitRecoveryMonitor({
+          issue: input.issue,
+          latestRun: input.latestRun,
+          actionId: recoveryAction.id,
+          agentId: recoveryAction.returnOwnerAgentId,
+        });
+      }
+      return updated;
+    }
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
     const recoveryOwner = recoveryAction.ownerAgentId ? await getAgent(recoveryAction.ownerAgentId) : null;

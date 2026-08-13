@@ -373,6 +373,8 @@ A comment or system notice can be evidence for a recovery action, but it is not 
 
 Source-scoped recovery actions are snapshots of the source issue's liveness state at the time the action was opened. They must be revalidated after newer durable source activity, including source issue status changes, assignee changes, blocker changes, execution policy or monitor changes, document or work-product updates that define a valid waiting path, and structured resume or disposition updates.
 
+Stranded-assigned escalation that mutates source status or ownership must revalidate the source inside the write transaction and lock its row before applying the mutation. A terminal source is a no-op: any provisional recovery action is cancelled as a false positive, and the escalation emits no recovery comment, wake, or monitor. Source-linked escalation side effects run only after the guarded issue update succeeds.
+
 When newer source activity restores a valid live or waiting path, the recovery action is stale and should be folded through the explicit recovery lifecycle instead of being hidden or deleted. Folding means resolving or cancelling the recovery action with a resolution outcome and note that preserve the audit trail.
 
 Plain comments alone do not make a recovery action stale. A comment can provide evidence, but the recovery action should remain visible when the source issue is still stalled and the comment does not create a valid action-path primitive such as a wake, monitor, interaction, approval, blocker, human owner, execution participant, terminal disposition, or delegated follow-up.
