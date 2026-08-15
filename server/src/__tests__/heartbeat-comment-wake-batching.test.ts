@@ -1358,7 +1358,21 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
-  it("still reopens a finished issue when a deferred batch mixes self-authored and human comments", async () => {
+  it.each([
+    {
+      caseName: "starts with a stamped self-comment",
+      firstAuthorUserId: "local-cli-user",
+      stampClosingRunId: true,
+    },
+    {
+      caseName: "starts with an unstamped local-board comment",
+      firstAuthorUserId: "local-board",
+      stampClosingRunId: false,
+    },
+  ])("still reopens a finished issue when a deferred batch $caseName before a human comment", async ({
+    firstAuthorUserId,
+    stampClosingRunId,
+  }) => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1432,14 +1446,14 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         return run?.status === "running";
       });
 
-      const selfComment = await db
+      const firstComment = await db
         .insert(issueComments)
         .values({
           companyId,
           issueId,
-          authorUserId: "local-cli-user",
-          createdByRunId: firstRun?.id ?? null,
-          body: "Closing note from the same run",
+          authorUserId: firstAuthorUserId,
+          createdByRunId: stampClosingRunId ? firstRun?.id ?? null : null,
+          body: "First comment queued behind the active run",
         })
         .returning()
         .then((rows) => rows[0]);
@@ -1448,16 +1462,16 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_commented",
-        payload: { issueId, commentId: selfComment.id },
+        payload: { issueId, commentId: firstComment.id },
         contextSnapshot: {
           issueId,
           taskId: issueId,
-          commentId: selfComment.id,
-          wakeCommentId: selfComment.id,
+          commentId: firstComment.id,
+          wakeCommentId: firstComment.id,
           wakeReason: "issue_commented",
         },
         requestedByActorType: "user",
-        requestedByActorId: "local-cli-user",
+        requestedByActorId: firstAuthorUserId,
       });
 
       expect(firstDeferredRun).toBeNull();
@@ -1554,7 +1568,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       const secondWake = parseWakePayloadFromMessage(secondPayload.message);
       expect(secondWake).toMatchObject({
         reason: "issue_commented",
-        commentIds: [selfComment.id, humanComment.id],
+        commentIds: [firstComment.id, humanComment.id],
         latestCommentId: humanComment.id,
         issue: {
           id: issueId,
