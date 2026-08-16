@@ -455,6 +455,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // behavior (a continuation requeue or escalation — either produces a
     // wake), proving the stand-down is scoped to operator attribution.
     expect(enqueueWakeup).toHaveBeenCalled();
+  });
+
   it("coalesces reset-less provider-quota recovery passes on one stable fallback retry", async () => {
     const { companyId, coderId, sourceIssueId, sourceIssue } = await seedCompany();
     const latestRun = {
@@ -623,7 +625,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(wakeups.filter((wakeup) => wakeup.status === "cancelled")).toEqual([
       expect.objectContaining({ agentId: coderId }),
     ]);
-
   });
 
   it("preserves the current assignee's quota retry when recovery receives a stale issue snapshot", async () => {
@@ -751,54 +752,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("schedules a provider-quota monitor for the original assignee without creating recovery work", async () => {
-    const { companyId, coderId, sourceIssueId } = await seedCompany();
-    const runId = randomUUID();
-    await db.insert(heartbeatRuns).values({
-      id: runId,
-      companyId,
-      agentId: coderId,
-      invocationSource: "manual",
-      status: "failed",
-      error: "You've hit your usage limit for GPT-5. Try again at 12:00 AM (UTC).",
-      errorCode: "adapter_failed",
-      startedAt: new Date("2026-07-15T20:00:00.000Z"),
-      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
-    });
-    const enqueueWakeup = vi.fn(async () => null);
-    const recovery = recoveryService(db, { enqueueWakeup });
-
-    const result = await recovery.reconcileStrandedAssignedIssues();
-
-    expect(result.providerQuotaMonitored).toBe(1);
-    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-    expect(updatedIssue).toMatchObject({
-      status: "in_progress",
-      assigneeAgentId: coderId,
-      monitorScheduledBy: "assignee",
-      monitorNotes: "Provider usage quota reached; retry the original assignee at the provider reset time.",
-    });
-    expect(updatedIssue?.monitorNextCheckAt).toBeInstanceOf(Date);
-    expect(updatedIssue?.executionPolicy).toMatchObject({
-      monitor: {
-        serviceName: "AI provider quota",
-        externalRef: runId,
-        maxAttempts: null,
-        recoveryPolicy: "wake_owner",
-      },
-    });
-    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(updatedRun).toMatchObject({ errorCode: "provider_quota" });
-    expect(updatedRun?.resultJson).toMatchObject({ errorFamily: "provider_quota" });
-    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-
-    const secondResult = await recovery.reconcileStrandedAssignedIssues();
-    expect(secondResult).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
-    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
-  });
-
   it("schedules one reset-boundary retry for the current assignee after provider-quota reassignment", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     const runId = randomUUID();
@@ -898,6 +851,54 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           inArray(heartbeatRuns.status, ["queued", "running"]),
         )),
     ).toHaveLength(0);
+  });
+
+  it("schedules a provider-quota monitor for the original assignee without creating recovery work", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "You've hit your usage limit for GPT-5. Try again at 12:00 AM (UTC).",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.providerQuotaMonitored).toBe(1);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+      monitorScheduledBy: "assignee",
+      monitorNotes: "Provider usage quota reached; retry the original assignee at the provider reset time.",
+    });
+    expect(updatedIssue?.monitorNextCheckAt).toBeInstanceOf(Date);
+    expect(updatedIssue?.executionPolicy).toMatchObject({
+      monitor: {
+        serviceName: "AI provider quota",
+        externalRef: runId,
+        maxAttempts: null,
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun).toMatchObject({ errorCode: "provider_quota" });
+    expect(updatedRun?.resultJson).toMatchObject({ errorFamily: "provider_quota" });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const secondResult = await recovery.reconcileStrandedAssignedIssues();
+    expect(secondResult).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
   });
 
   it("schedules another provider-quota monitor after a prior quota monitor fired", async () => {
