@@ -2590,8 +2590,22 @@ async function listIssueBlockerAttentionMap(
     seen: Set<string>,
   ): PathClassification => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
-    if (truncated || seen.has(nodeId)) {
+    if (truncated) {
       return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null };
+    }
+    if (seen.has(nodeId)) {
+      // blockerAttention walks both first-class blocker edges and unfinished
+      // child edges. Those two edge classes can form a mixed cycle even though
+      // the first-class blocker graph is acyclic (parent -> child -> parent).
+      // Never report the root as its own blocker when that happens. The caller
+      // falls back to the direct edge that entered the cycle, which is honest
+      // and actionable without inventing a self-edge in the API projection.
+      return {
+        covered: false,
+        stalled: false,
+        sampleBlockerIdentifier: null,
+        sampleStalledBlockerIdentifier: null,
+      };
     }
     const node = nodesById.get(nodeId);
     if (!node || node.companyId !== companyId) {

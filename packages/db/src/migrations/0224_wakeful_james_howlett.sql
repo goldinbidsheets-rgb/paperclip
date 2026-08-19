@@ -1,0 +1,1 @@
+ALTER TABLE "issue_relations" ADD CONSTRAINT "issue_relations_no_self_block_check" CHECK ("issue_relations"."issue_id" <> "issue_relations"."related_issue_id");

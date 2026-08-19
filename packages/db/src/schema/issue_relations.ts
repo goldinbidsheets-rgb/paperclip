@@ -1,4 +1,5 @@
-import { index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { check, index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
@@ -25,6 +26,10 @@ export const issueRelations = pgTable(
       table.issueId,
       table.relatedIssueId,
       table.type,
+    ),
+    noSelfBlockCheck: check(
+      "issue_relations_no_self_block_check",
+      sql`${table.issueId} <> ${table.relatedIssueId}`,
     ),
   }),
 );

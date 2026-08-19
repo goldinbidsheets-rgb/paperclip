@@ -39,7 +39,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-blocker-attention-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueThreadInteractions);
@@ -170,6 +170,58 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: "PBC-2",
     });
+  });
+
+  it("does not project a mixed child/blocker cycle as a self-blocker", async () => {
+    const { companyId, agentId } = await createCompany("PBCY");
+    const parentId = await insertIssue({
+      companyId,
+      identifier: "PBCY-1",
+      title: "Blocked parent",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    const childId = await insertIssue({
+      companyId,
+      identifier: "PBCY-2",
+      title: "Child blocked by its parent",
+      status: "blocked",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: parentId, blockedIssueId: childId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      sampleBlockerIdentifier: "PBCY-2",
+      directBlockerIssueId: childId,
+    });
+    expect(parent?.blockerAttention?.sampleBlockerIdentifier).not.toBe("PBCY-1");
+    expect(parent?.blockerAttention?.terminalBlockerIssueId).not.toBe(parentId);
+  });
+
+  it("rejects literal self-blocker relations at both service and storage boundaries", async () => {
+    const { companyId } = await createCompany("PBSF");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "PBSF-1",
+      title: "Cannot block itself",
+      status: "blocked",
+    });
+
+    await expect(svc.update(issueId, { blockedByIssueIds: [issueId] })).rejects.toThrow(
+      "Issue cannot be blocked by itself",
+    );
+    await expect(db.insert(issueRelations).values({
+      companyId,
+      issueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    })).rejects.toThrow();
   });
 
   it("classifies an assigned backlog blocker leaf without a waiting path as attention-needed", async () => {
