@@ -73,6 +73,20 @@ describe("inbox live descendant status helpers", () => {
     }
   });
 
+  it("does not turn an unknown blocker graph into covered attention", () => {
+    const original = makeBlockerAttention({
+      state: "unknown",
+      reason: "truncated",
+      unknownBlockerCount: 1,
+    });
+    const attention = resolveInboxIssueBlockerAttention(
+      makeIssue({ blockerAttention: original, liveDescendantCount: 4 }),
+      { isLive: false },
+    );
+
+    expect(attention).toBe(original);
+  });
+
   it("does not synthesize covered attention for the live row itself or non-blocked parents", () => {
     expect(
       resolveInboxIssueBlockerAttention(

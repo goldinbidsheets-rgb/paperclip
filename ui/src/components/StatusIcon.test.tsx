@@ -86,6 +86,28 @@ describe("StatusIcon", () => {
     expect(html).toContain("Blocked · review stalled on PAP-2279");
   });
 
+  it("surfaces an uncomputable blocker graph without calling it covered", () => {
+    const html = renderToStaticMarkup(
+      <StatusIcon
+        status="blocked"
+        blockerAttention={{
+          state: "unknown",
+          reason: "truncated",
+          unresolvedBlockerCount: 0,
+          coveredBlockerCount: 0,
+          stalledBlockerCount: 0,
+          attentionBlockerCount: 0,
+          unknownBlockerCount: 1,
+          sampleBlockerIdentifier: null,
+          sampleStalledBlockerIdentifier: null,
+        }}
+      />,
+    );
+    expect(html).toContain("Blocked · blocker graph was truncated and could not be evaluated");
+    expect(html).toContain("var(--status-task-icon-blocked)");
+    expect(html).not.toContain("var(--status-task-icon-in_queue)");
+  });
+
   it("uses an accessible native button for the icon-only picker trigger", () => {
     const html = renderToStaticMarkup(<StatusIcon status="todo" onChange={() => {}} />);
     expect(html).toContain('viewBox="0 0 24 24"');

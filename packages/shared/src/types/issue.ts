@@ -391,13 +391,15 @@ export interface IssueSubtreeDiagnosticsResponse {
   };
 }
 
-export type IssueBlockerAttentionState = "none" | "covered" | "stalled" | "needs_attention";
+export type IssueBlockerAttentionState = "none" | "covered" | "stalled" | "needs_attention" | "unknown";
 
 export type IssueBlockerAttentionReason =
   | "active_child"
   | "active_dependency"
   | "stalled_review"
   | "attention_required"
+  | "truncated"
+  | "cycle_detected"
   | null;
 
 export interface IssueBlockerAttentionIssueSummary {
@@ -413,6 +415,8 @@ export interface IssueBlockerAttention {
   coveredBlockerCount: number;
   stalledBlockerCount: number;
   attentionBlockerCount: number;
+  /** Paths whose blocker-tree liveness could not be classified completely. */
+  unknownBlockerCount?: number;
   pendingFinalizeBlockerIssueIds?: string[];
   sampleBlockerIdentifier: string | null;
   sampleStalledBlockerIdentifier: string | null;

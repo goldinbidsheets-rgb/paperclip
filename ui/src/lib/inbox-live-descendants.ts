@@ -34,7 +34,11 @@ export function resolveInboxIssueBlockerAttention(
 ): IssueBlockerAttention | null {
   const blockerAttention = asBlockerAttention(issue.blockerAttention);
   if (issue.status !== "blocked" || options.isLive) return blockerAttention;
-  if (blockerAttention?.state === "needs_attention" || blockerAttention?.state === "stalled") {
+  if (
+    blockerAttention?.state === "needs_attention"
+    || blockerAttention?.state === "stalled"
+    || blockerAttention?.state === "unknown"
+  ) {
     return blockerAttention;
   }
   if (blockerAttention?.state === "covered") return blockerAttention;
@@ -49,6 +53,7 @@ export function resolveInboxIssueBlockerAttention(
     coveredBlockerCount: liveDescendantCount,
     stalledBlockerCount: blockerAttention?.stalledBlockerCount ?? 0,
     attentionBlockerCount: blockerAttention?.attentionBlockerCount ?? 0,
+    unknownBlockerCount: blockerAttention?.unknownBlockerCount ?? 0,
     sampleBlockerIdentifier: blockerAttention?.sampleBlockerIdentifier ?? null,
     sampleStalledBlockerIdentifier: blockerAttention?.sampleStalledBlockerIdentifier ?? null,
   };

@@ -24,6 +24,13 @@ interface StatusIconProps {
 function blockedAttentionLabel(blockerAttention: IssueBlockerAttention | null | undefined) {
   if (!blockerAttention || blockerAttention.state === "none") return "Blocked";
 
+  if (blockerAttention.state === "unknown") {
+    if (blockerAttention.reason === "cycle_detected") {
+      return "Blocked · blocker graph contains a cycle and could not be evaluated";
+    }
+    return "Blocked · blocker graph was truncated and could not be evaluated";
+  }
+
   if (blockerAttention.reason === "active_child") {
     const count = blockerAttention.coveredBlockerCount;
     if (count === 1 && blockerAttention.sampleBlockerIdentifier) {

@@ -2091,6 +2091,7 @@ function createIssueBlockerAttention(input: Partial<IssueBlockerAttention> = {})
     coveredBlockerCount: input.coveredBlockerCount ?? 0,
     stalledBlockerCount: input.stalledBlockerCount ?? 0,
     attentionBlockerCount: input.attentionBlockerCount ?? 0,
+    unknownBlockerCount: input.unknownBlockerCount ?? 0,
     pendingFinalizeBlockerIssueIds: input.pendingFinalizeBlockerIssueIds ?? [],
     sampleBlockerIdentifier: input.sampleBlockerIdentifier ?? null,
     sampleStalledBlockerIdentifier: input.sampleStalledBlockerIdentifier ?? null,
@@ -2347,10 +2348,11 @@ async function listIssueBlockerAttentionMap(
 
   const nodesById = new Map<string, IssueBlockerAttentionNode>();
   const edgesByIssueId = new Map<string, IssueBlockerAttentionEdge[]>();
+  const unresolvedExplicitBlockerIdsByIssueId = new Map<string, Set<string>>();
   for (const root of roots) nodesById.set(root.id, { ...root });
 
   let frontier = roots.map((root) => root.id);
-  let truncated = false;
+  const truncatedNodeIds = new Set<string>();
   const pendingFinalizeBlockerIssueIds = new Set<string>();
   for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
     const nextFrontier = new Set<string>();
@@ -2416,6 +2418,12 @@ async function listIssueBlockerAttentionMap(
       const unresolvedExplicitBlockerRows = explicitBlockerRows.filter(
         (row) => row.status !== "done" || pendingFinalizeBlockerIssueIds.has(row.blockerIssueId),
       );
+      for (const row of unresolvedExplicitBlockerRows) {
+        if (!row.issueId) continue;
+        const blockerIds = unresolvedExplicitBlockerIdsByIssueId.get(row.issueId) ?? new Set<string>();
+        blockerIds.add(row.blockerIssueId);
+        unresolvedExplicitBlockerIdsByIssueId.set(row.issueId, blockerIds);
+      }
       appendBlockerAttentionEdges(edgesByIssueId, [
         ...unresolvedExplicitBlockerRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
@@ -2442,13 +2450,14 @@ async function listIssueBlockerAttentionMap(
       }
     }
 
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) {
-      truncated = true;
+    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES && nextFrontier.size > 0) {
+      for (const nodeId of nextFrontier) truncatedNodeIds.add(nodeId);
+      frontier = [];
       break;
     }
     frontier = [...nextFrontier];
   }
-  if (frontier.length > 0) truncated = true;
+  for (const nodeId of frontier) truncatedNodeIds.add(nodeId);
 
   const nodeIds = [...nodesById.keys()];
   const activeIssueIds = new Set<string>();
@@ -2581,6 +2590,7 @@ async function listIssueBlockerAttentionMap(
   type PathClassification = {
     covered: boolean;
     stalled: boolean;
+    unknownReason?: "truncated" | "cycle_detected";
     sampleBlockerIdentifier: string | null;
     sampleStalledBlockerIdentifier: string | null;
     terminalBlockerIssueId?: string | null;
@@ -2589,13 +2599,33 @@ async function listIssueBlockerAttentionMap(
     nodeId: string,
     seen: Set<string>,
   ): PathClassification => {
-    const sample = blockerSampleIdentifier(nodesById.get(nodeId));
-    if (truncated || seen.has(nodeId)) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null };
+    if (truncatedNodeIds.has(nodeId)) {
+      return {
+        covered: false,
+        stalled: false,
+        unknownReason: "truncated",
+        sampleBlockerIdentifier: null,
+        sampleStalledBlockerIdentifier: null,
+      };
+    }
+    if (seen.has(nodeId)) {
+      return {
+        covered: false,
+        stalled: false,
+        unknownReason: "cycle_detected",
+        sampleBlockerIdentifier: null,
+        sampleStalledBlockerIdentifier: null,
+      };
     }
     const node = nodesById.get(nodeId);
     if (!node || node.companyId !== companyId) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeId, sampleStalledBlockerIdentifier: null };
+      return {
+        covered: false,
+        stalled: false,
+        unknownReason: "truncated",
+        sampleBlockerIdentifier: null,
+        sampleStalledBlockerIdentifier: null,
+      };
     }
     const nodeSample = blockerSampleIdentifier(node);
     if (node.status === "done" && !pendingFinalizeBlockerIssueIds.has(node.id)) {
@@ -2650,6 +2680,16 @@ async function listIssueBlockerAttentionMap(
       const nextSeen = new Set(seen);
       nextSeen.add(nodeId);
       const classified = downstream.map((edge) => classifyPath(edge.blockerIssueId, nextSeen));
+      const unknownChild = classified.find((result) => result.unknownReason);
+      if (unknownChild) {
+        return {
+          covered: false,
+          stalled: false,
+          unknownReason: unknownChild.unknownReason,
+          sampleBlockerIdentifier: null,
+          sampleStalledBlockerIdentifier: null,
+        };
+      }
       const stalledChild = classified.find((result) => result.stalled || result.sampleStalledBlockerIdentifier);
       const sampleStalled = stalledChild?.sampleStalledBlockerIdentifier ?? null;
       const hardAttention = classified.find((result) =>
@@ -2747,13 +2787,23 @@ async function listIssueBlockerAttentionMap(
     }));
     const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
-    const attentionBlockerCount = classified.length - coveredBlockerCount - stalledBlockerCount;
+    const unknownBlockerCount = classified.filter((entry) => entry.result.unknownReason).length;
+    const attentionBlockerCount = classified.length - coveredBlockerCount - stalledBlockerCount - unknownBlockerCount;
+    const unknownEntry = classified.find((entry) => entry.result.unknownReason);
     const hardAttentionEntry = classified.find((entry) =>
-      !entry.result.covered && !entry.result.stalled && entry.result.terminalBlockerIssueId
-    ) ?? classified.find((entry) => !entry.result.covered && !entry.result.stalled);
+      !entry.result.covered
+      && !entry.result.stalled
+      && !entry.result.unknownReason
+      && entry.result.terminalBlockerIssueId
+    ) ?? classified.find((entry) =>
+      !entry.result.covered && !entry.result.stalled && !entry.result.unknownReason
+    );
     const stalledEntry = classified.find((entry) => entry.result.stalled && entry.result.terminalBlockerIssueId)
       ?? classified.find((entry) => entry.result.stalled);
-    const sampleEntry = hardAttentionEntry ?? stalledEntry ?? classified[0] ?? null;
+    const sampleEntry = hardAttentionEntry
+      ?? stalledEntry
+      ?? classified.find((entry) => !entry.result.unknownReason)
+      ?? null;
     const sampleNode = sampleEntry ? nodesById.get(sampleEntry.edge.blockerIssueId) : null;
     const sampleStalledFromChain = classified
       .map((entry) => entry.result.sampleStalledBlockerIdentifier)
@@ -2769,7 +2819,10 @@ async function listIssueBlockerAttentionMap(
 
     let state: IssueBlockerAttention["state"];
     let reason: IssueBlockerAttention["reason"];
-    if (attentionBlockerCount > 0) {
+    if (unknownBlockerCount > 0) {
+      state = "unknown";
+      reason = unknownEntry?.result.unknownReason ?? "truncated";
+    } else if (attentionBlockerCount > 0) {
       state = "needs_attention";
       reason = "attention_required";
     } else if (stalledBlockerCount > 0) {
@@ -2785,20 +2838,25 @@ async function listIssueBlockerAttentionMap(
     attentionMap.set(root.id, createIssueBlockerAttention({
       state,
       reason,
-      unresolvedBlockerCount: topLevelEdges.length,
+      unresolvedBlockerCount: unresolvedExplicitBlockerIdsByIssueId.get(root.id)?.size ?? 0,
       coveredBlockerCount,
       stalledBlockerCount,
       attentionBlockerCount,
+      unknownBlockerCount,
       pendingFinalizeBlockerIssueIds: topLevelEdges
         .map((edge) => edge.blockerIssueId)
         .filter((blockerIssueId) => pendingFinalizeBlockerIssueIds.has(blockerIssueId)),
-      sampleBlockerIdentifier: sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode),
+      sampleBlockerIdentifier: state === "unknown"
+        ? null
+        : sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode),
       sampleStalledBlockerIdentifier:
-        stalledEntry?.result.sampleStalledBlockerIdentifier ?? sampleStalledFromChain ?? null,
+        state === "unknown"
+          ? null
+          : stalledEntry?.result.sampleStalledBlockerIdentifier ?? sampleStalledFromChain ?? null,
       blockingTreeLive: topLevelEdges.some((edge) => pathHasLiveWork(edge.blockerIssueId, new Set([root.id]))),
-      directBlockerIssueId: sampleEntry?.edge.blockerIssueId ?? null,
-      terminalBlockerIssueId,
-      terminalBlocker: terminalBlockerNode
+      directBlockerIssueId: state === "unknown" ? null : sampleEntry?.edge.blockerIssueId ?? null,
+      terminalBlockerIssueId: state === "unknown" ? null : terminalBlockerIssueId,
+      terminalBlocker: state !== "unknown" && terminalBlockerNode
         ? {
             id: terminalBlockerNode.id,
             identifier: terminalBlockerNode.identifier,

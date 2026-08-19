@@ -18,7 +18,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { issueService } from "../services/issues.js";
+import { BLOCKER_ATTENTION_MAX_DEPTH, issueService } from "../services/issues.js";
 import { buildIssueGraphLivenessIncidentKey } from "../services/recovery/origins.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -169,6 +169,99 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       coveredBlockerCount: 1,
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: "PBC-2",
+    });
+  });
+
+  it("reports only the truncated path as unknown and keeps first-class blocker counts honest", async () => {
+    const { companyId, agentId } = await createCompany("PBT");
+    const deepRootId = await insertIssue({
+      companyId,
+      identifier: "PBT-1",
+      title: "Deep child-only root",
+      status: "blocked",
+    });
+    let parentId = deepRootId;
+    for (let index = 0; index < BLOCKER_ATTENTION_MAX_DEPTH; index += 1) {
+      parentId = await insertIssue({
+        companyId,
+        identifier: `PBT-${index + 2}`,
+        title: `Deep child ${index + 1}`,
+        status: "todo",
+        parentId,
+        assigneeAgentId: agentId,
+      });
+    }
+
+    const simpleRootId = await insertIssue({
+      companyId,
+      identifier: "PBT-20",
+      title: "Unrelated simple root",
+      status: "blocked",
+    });
+    const simpleBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBT-21",
+      title: "Simple blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: simpleBlockerId, blockedIssueId: simpleRootId });
+
+    const blocked = await svc.list(companyId, { status: "blocked" });
+    const deepRoot = blocked.find((issue) => issue.id === deepRootId);
+    const simpleRoot = blocked.find((issue) => issue.id === simpleRootId);
+
+    expect(deepRoot?.blockerAttention).toMatchObject({
+      state: "unknown",
+      reason: "truncated",
+      unresolvedBlockerCount: 0,
+      coveredBlockerCount: 0,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
+      unknownBlockerCount: 1,
+      sampleBlockerIdentifier: null,
+      directBlockerIssueId: null,
+      terminalBlockerIssueId: null,
+    });
+    expect(simpleRoot?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+      unknownBlockerCount: 0,
+      sampleBlockerIdentifier: "PBT-21",
+    });
+  });
+
+  it("reports a mixed child/blocker cycle as unknown without fabricating a self sample", async () => {
+    const { companyId, agentId } = await createCompany("PBY");
+    const rootId = await insertIssue({
+      companyId,
+      identifier: "PBY-1",
+      title: "Cycle root",
+      status: "blocked",
+    });
+    const childId = await insertIssue({
+      companyId,
+      identifier: "PBY-2",
+      title: "Child blocked by its parent",
+      status: "todo",
+      parentId: rootId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: rootId, blockedIssueId: childId });
+
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+
+    expect(root?.blockerAttention).toMatchObject({
+      state: "unknown",
+      reason: "cycle_detected",
+      unresolvedBlockerCount: 0,
+      attentionBlockerCount: 0,
+      unknownBlockerCount: 1,
+      sampleBlockerIdentifier: null,
+      directBlockerIssueId: null,
+      terminalBlockerIssueId: null,
     });
   });
 
