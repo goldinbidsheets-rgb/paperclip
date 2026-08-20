@@ -127,7 +127,19 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
-import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import {
+  logActivity,
+  publishActivity,
+  publishPluginDomainEvent,
+  type ActivityPublication,
+  type LogActivityInput,
+} from "./activity-log.js";
+import {
+  evaluateHostCapacityPreflight,
+  hostCapacityDecisionPayload,
+  HOST_CAPACITY_BLOCK_ERROR_CODE,
+  type HostCapacityPreflightDecision,
+} from "./host-capacity-preflight.js";
 import {
   buildWorkspaceReadyComment,
   buildWorkspaceReadyMetadata,
@@ -12483,6 +12495,144 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  type HostCapacityBlockedDecision = Extract<
+    HostCapacityPreflightDecision,
+    { enabled: true; allowed: false }
+  >;
+
+  function hostCapacityBlockMessage(decision: HostCapacityBlockedDecision) {
+    if (decision.reason === "below_floor") {
+      return `Blocked before adapter invocation because host free bytes ${decision.freeBytes?.toString() ?? "unknown"} are below the configured minimum ${decision.minimumFreeBytes?.toString() ?? "unknown"}`;
+    }
+    if (decision.reason === "invalid_configuration") {
+      return "Blocked before adapter invocation because the host capacity floor configuration is invalid";
+    }
+    return "Blocked before adapter invocation because host free space could not be measured";
+  }
+
+  async function blockQueuedRunForHostCapacity(
+    run: typeof heartbeatRuns.$inferSelect,
+    decision: HostCapacityBlockedDecision,
+  ) {
+    const now = new Date();
+    const message = hostCapacityBlockMessage(decision);
+    const payload = hostCapacityDecisionPayload(decision);
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    const activityPublications: ActivityPublication[] = [];
+    const blocked = await db.transaction(async (tx) => {
+      const [blockedRun] = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: message,
+          errorCode: HOST_CAPACITY_BLOCK_ERROR_CODE,
+          finishedAt: now,
+          resultJson: {
+            ...parseObject(run.resultJson),
+            stopReason: HOST_CAPACITY_BLOCK_ERROR_CODE,
+            hostCapacityPreflight: payload,
+          },
+          updatedAt: now,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning();
+      if (!blockedRun) return null;
+
+      if (blockedRun.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "failed",
+            finishedAt: now,
+            error: message,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, blockedRun.wakeupRequestId));
+      }
+
+      const [eventSeqRow] = await tx
+        .select({ maxSeq: sql<number>`max(${heartbeatRunEvents.seq})` })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, blockedRun.id));
+      const eventSeq = Number(eventSeqRow?.maxSeq ?? 0) + 1;
+      await tx.insert(heartbeatRunEvents).values({
+        companyId: blockedRun.companyId,
+        runId: blockedRun.id,
+        agentId: blockedRun.agentId,
+        seq: eventSeq,
+        eventType: "lifecycle",
+        stream: "system",
+        level: "error",
+        message,
+        payload,
+        createdAt: now,
+      });
+      await logActivity(tx as unknown as Db, {
+        companyId: blockedRun.companyId,
+        actorType: "system",
+        actorId: "host_capacity_preflight",
+        agentId: blockedRun.agentId,
+        runId: blockedRun.id,
+        issueId,
+        action: "heartbeat.host_capacity_preflight_blocked",
+        entityType: "heartbeat_run",
+        entityId: blockedRun.id,
+        details: {
+          ...payload,
+          issueId,
+          blockedBeforeAdapterInvocation: true,
+        },
+      }, activityPublications);
+      return { run: blockedRun, eventSeq };
+    });
+    if (!blocked) return false;
+
+    publishLiveEvent({
+      companyId: blocked.run.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: blocked.run.id,
+        agentId: blocked.run.agentId,
+        status: blocked.run.status,
+        invocationSource: blocked.run.invocationSource,
+        triggerDetail: blocked.run.triggerDetail,
+        error: blocked.run.error ?? null,
+        errorCode: blocked.run.errorCode ?? null,
+        startedAt: null,
+        finishedAt: now.toISOString(),
+      },
+    });
+    publishRunLifecyclePluginEvent(blocked.run);
+    publishLiveEvent({
+      companyId: blocked.run.companyId,
+      type: "heartbeat.run.event",
+      payload: {
+        runId: blocked.run.id,
+        agentId: blocked.run.agentId,
+        issueId,
+        seq: blocked.eventSeq,
+        eventType: "lifecycle",
+        stream: "system",
+        level: "error",
+        color: null,
+        message,
+        currentToolName: null,
+        lastAssistantSnippet: null,
+        lastEventAt: now.toISOString(),
+        payload,
+      },
+    });
+    for (const publication of activityPublications) publishActivity(publication);
+    logger.error({
+      runId: blocked.run.id,
+      companyId: blocked.run.companyId,
+      agentId: blocked.run.agentId,
+      issueId,
+      ...payload,
+    }, "host capacity preflight blocked queued heartbeat run");
+    return true;
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -12495,6 +12645,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await cancelRunInternal(run.id, `Cancelled because the agent is not invokable: ${invokability.reason}`);
+      return null;
+    }
+
+    const hostCapacity = await evaluateHostCapacityPreflight();
+    if (hostCapacity.enabled && !hostCapacity.allowed) {
+      await blockQueuedRunForHostCapacity(run, hostCapacity);
       return null;
     }
 

@@ -117,6 +117,15 @@ A lightweight scheduler/worker in the server process handles:
 - stuck run detection
 - budget threshold checks
 
+When a deployment configures a host free-space floor, the worker measures the
+protected filesystem immediately before claiming each queued heartbeat run. A
+below-floor result, malformed configured floor, or measurement failure MUST
+fail the queued run before an execution lock or adapter process is created. The
+terminal run, lifecycle event, and activity receipt MUST carry the same reason
+and exact byte values when available. Concurrent claim attempts MUST yield one
+terminal receipt. This run-admission control MUST leave the API/control plane
+available and MUST NOT perform retention or cleanup as a side effect.
+
 Separate queue infrastructure is not required for V1.
 
 ## 7. Canonical Data Model (V1)

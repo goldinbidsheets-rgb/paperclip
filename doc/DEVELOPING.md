@@ -877,6 +877,19 @@ Environment overrides:
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_RUN_MIN_FREE_BYTES=<positive integer bytes>` enables a fail-closed
+  filesystem-capacity check immediately before a queued heartbeat run is claimed.
+  Below-floor, invalid-configuration, and measurement-failure decisions fail the
+  run before adapter invocation and write a durable audit receipt. When unset,
+  the check is disabled.
+- `PAPERCLIP_RUN_CAPACITY_PATH=/existing/path` selects the path whose filesystem
+  is measured by the run-capacity check. It defaults to the Paperclip instance
+  root.
+
+See [Host Capacity Admission and State Retention](./HOST-CAPACITY-AND-RETENTION.md)
+for floor selection, evidence-aware retention classes, mandatory holds, and the
+deployment sequence. Database backups, durable run logs, managed workspaces,
+and scratch data are distinct retention classes.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,
