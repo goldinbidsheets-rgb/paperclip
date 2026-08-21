@@ -1907,7 +1907,11 @@ function normalizeSecretRefsForConfigComparison(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(normalizeSecretRefsForConfigComparison);
   if (!value || typeof value !== "object") return value;
   const record = value as Record<string, unknown>;
-  if (record.type === "secret_ref") return { type: "secret_ref" };
+  if (record.type === "secret_ref") {
+    return Object.fromEntries(
+      Object.entries(record).filter(([key]) => key !== "secretId" && key !== "version"),
+    );
+  }
   return Object.fromEntries(
     Object.entries(record).map(([key, entry]) => [key, normalizeSecretRefsForConfigComparison(entry)]),
   );

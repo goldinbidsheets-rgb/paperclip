@@ -509,6 +509,18 @@ describe("resolveWithSecretBindingConfigRefresh", () => {
       ...initialConfig,
       command: "claude-beta",
     })).toBe(false);
+    expect(isSecretRefOnlyConfigChange(initialConfig, {
+      command: "claude",
+      env: {
+        CLAUDE_CODE_OAUTH_TOKEN: {
+          type: "secret_ref",
+          secretId: "secret-token-4",
+          version: 2,
+          projectionClass: "token",
+          projectionAllowlistKey: "CLAUDE_CODE_OAUTH_TOKEN",
+        },
+      },
+    })).toBe(false);
   });
 
   it("retries once with a refreshed config when an agent secret binding changes during pre-dispatch", async () => {
