@@ -1,7 +1,6 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { HttpError } from "../errors.js";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const UNRELATED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
@@ -991,6 +990,9 @@ describe.sequential("issue thread interaction routes", () => {
   });
 
   it("returns winner attribution when cancellation loses an exact-once race", async () => {
+    // `beforeEach` resets the module graph, so import HttpError in the same graph
+    // that createApp (and therefore errorHandler) will use for this request.
+    const { HttpError } = await import("../errors.js");
     mockInteractionService.cancelQuestions.mockRejectedValueOnce(new HttpError(
       409,
       "Interaction has already been resolved",
