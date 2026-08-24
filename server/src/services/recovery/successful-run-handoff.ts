@@ -45,6 +45,7 @@ export type RecoveryActionExhaustionSource = {
   cause: string;
   ownerType?: string | null;
   ownerAgentId?: string | null;
+  ownerUserId?: string | null;
   evidence?: unknown;
   maxAttempts?: number | null;
   wakePolicy?: unknown;
@@ -99,11 +100,16 @@ export function exhaustedMissingDispositionNormalizationPatch() {
     status: "escalated" as const,
     ownerType: "board" as const,
     ownerAgentId: null,
+    ownerUserId: null,
     wakePolicy: {
       type: SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_WAKE_POLICY.type,
       reason: SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_WAKE_POLICY.reason,
     },
   };
+}
+
+function hasOwnerUserId(action: RecoveryActionExhaustionSource): boolean {
+  return typeof action.ownerUserId === "string" && action.ownerUserId.trim().length > 0;
 }
 
 export function needsExhaustedMissingDispositionNormalization(
@@ -114,12 +120,14 @@ export function needsExhaustedMissingDispositionNormalization(
   return action.status !== patch.status
     || action.ownerType !== patch.ownerType
     || Boolean(action.ownerAgentId)
+    || hasOwnerUserId(action)
     || readWakePolicyType(action.wakePolicy) !== patch.wakePolicy.type;
 }
 
 export type BoardAttentionRecoveryActionPresentation = {
   status: "active" | "escalated";
   ownerType: "user" | "board";
+  ownerUserId: string | null;
   exhausted: boolean;
   whyNow: string;
   severity: "high" | "medium";
@@ -137,6 +145,7 @@ export function presentRecoveryActionForBoardAttention(
   return {
     status: normalized.status,
     ownerType: normalized.ownerType,
+    ownerUserId: hasOwnerUserId(normalized) ? normalized.ownerUserId ?? null : null,
     exhausted,
     whyNow: normalized.status === "escalated"
       ? "Recovery action escalated to a human owner."

@@ -1431,7 +1431,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
               kind: recovery.kind,
               cause: recovery.cause,
               ownerType: presented.ownerType,
-              ownerUserId: recovery.ownerUserId,
+              ownerUserId: presented.ownerUserId,
               sourceIssueId: recovery.sourceIssueId,
               recoveryIssueId: recovery.recoveryIssueId,
               exhausted: presented.exhausted,

@@ -136,6 +136,7 @@ describe("exhausted missing-disposition recovery semantics", () => {
     expect(presentRecoveryActionForBoardAttention(legacy)).toEqual({
       status: "escalated",
       ownerType: "board",
+      ownerUserId: null,
       exhausted: true,
       whyNow: "Recovery action escalated to a human owner.",
       severity: "high",
@@ -181,6 +182,36 @@ describe("exhausted missing-disposition recovery semantics", () => {
     expect(presentRecoveryActionForBoardAttention(honest)).toEqual({
       status: "escalated",
       ownerType: "board",
+      ownerUserId: null,
+      exhausted: true,
+      whyNow: "Recovery action escalated to a human owner.",
+      severity: "high",
+    });
+  });
+
+  it("treats a leftover ownerUserId on a board-owned exhausted row as inconsistent", () => {
+    const staleOwner = {
+      status: "escalated",
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: "user-1",
+      evidence: {
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+        exhausted: true,
+      },
+      wakePolicy: {
+        type: "board_escalation",
+        reason: "successful_run_handoff_exhausted",
+      },
+    };
+
+    expect(needsExhaustedMissingDispositionNormalization(staleOwner)).toBe(true);
+    expect(presentRecoveryActionForBoardAttention(staleOwner)).toEqual({
+      status: "escalated",
+      ownerType: "board",
+      ownerUserId: null,
       exhausted: true,
       whyNow: "Recovery action escalated to a human owner.",
       severity: "high",

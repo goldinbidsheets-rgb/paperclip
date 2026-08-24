@@ -451,6 +451,7 @@ export function issueRecoveryActionService(db: Db) {
           status: patch.status,
           ownerType: patch.ownerType,
           ownerAgentId: patch.ownerAgentId,
+          ownerUserId: patch.ownerUserId,
           previousOwnerAgentId: action.previousOwnerAgentId ?? action.ownerAgentId,
           wakePolicy: patch.wakePolicy,
           evidence: {
@@ -468,6 +469,8 @@ export function issueRecoveryActionService(db: Db) {
         .where(
           and(
             eq(issueRecoveryActions.id, action.id),
+            eq(issueRecoveryActions.cause, SUCCESSFUL_RUN_MISSING_STATE_REASON),
+            eq(issueRecoveryActions.updatedAt, action.updatedAt),
             inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
           ),
         )
