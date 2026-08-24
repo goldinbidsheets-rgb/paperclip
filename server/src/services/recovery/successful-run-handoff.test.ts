@@ -250,7 +250,7 @@ describe("exhausted missing-disposition recovery semantics", () => {
     expect(notice.body).not.toContain("blocked on a recovery owner");
     expect(notice.presentation).toMatchObject({ title: "Missing disposition recovery exhausted" });
     expect(notice.metadata.sections?.[0]?.rows).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "key_value", label: "Recovery owner", value: "board" }),
+      expect.objectContaining({ type: "key_value", label: "Recovery owner", value: "Board decision required" }),
       expect.objectContaining({ type: "key_value", label: "Wake path", value: "exhausted — not a live agent wake" }),
     ]));
   });
