@@ -38,6 +38,7 @@ export type UpsertIssueRecoveryActionInput = {
   nextAction: string;
   wakePolicy?: Record<string, unknown> | null;
   monitorPolicy?: Record<string, unknown> | null;
+  status?: Extract<IssueRecoveryActionStatus, "active" | "escalated">;
   maxAttempts?: number | null;
   timeoutAt?: Date | null;
   lastAttemptAt?: Date | null;
@@ -204,7 +205,7 @@ export function issueRecoveryActionService(db: Db) {
       sourceIssueId: input.sourceIssueId,
       recoveryIssueId: input.recoveryIssueId ?? null,
       kind: input.kind,
-      status: "active" as const,
+      status: input.status ?? "active",
       ownerType,
       ownerAgentId: input.ownerAgentId ?? null,
       ownerUserId: input.ownerUserId ?? null,
@@ -289,54 +290,57 @@ export function issueRecoveryActionService(db: Db) {
       ) {
         return supersedePriorAndInsert(input, existing.id, ownerType, now, retryCount);
       }
+      // An explicit status write (exhausted -> escalated) is a contract change
+      // and must not keep a prior live-looking owner or wake policy.
+      const preserveOwner = Boolean(input.preserveExistingOwner) && input.status == null;
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
-          recoveryIssueId: input.preserveExistingOwner
+          recoveryIssueId: preserveOwner
             ? existing.recoveryIssueId
             : input.recoveryIssueId ?? null,
-          kind: input.preserveExistingOwner ? existing.kind : input.kind,
-          status: input.preserveExistingOwner ? existing.status : "active",
-          ownerType: input.preserveExistingOwner ? existing.ownerType : ownerType,
-          ownerAgentId: input.preserveExistingOwner
+          kind: preserveOwner ? existing.kind : input.kind,
+          status: input.status ?? (preserveOwner ? existing.status : "active"),
+          ownerType: preserveOwner ? existing.ownerType : ownerType,
+          ownerAgentId: preserveOwner
             ? existing.ownerAgentId
             : input.ownerAgentId ?? null,
-          ownerUserId: input.preserveExistingOwner
+          ownerUserId: preserveOwner
             ? existing.ownerUserId
             : input.ownerUserId ?? null,
-          previousOwnerAgentId: input.preserveExistingOwner
+          previousOwnerAgentId: preserveOwner
             ? existing.previousOwnerAgentId
             : input.previousOwnerAgentId ?? existing.previousOwnerAgentId,
-          returnOwnerAgentId: input.preserveExistingOwner
+          returnOwnerAgentId: preserveOwner
             ? existing.returnOwnerAgentId
             : input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
-          cause: input.preserveExistingOwner ? existing.cause : input.cause,
-          fingerprint: input.preserveExistingOwner ? existing.fingerprint : input.fingerprint,
-          evidence: input.preserveExistingOwner
+          cause: preserveOwner ? existing.cause : input.cause,
+          fingerprint: preserveOwner ? existing.fingerprint : input.fingerprint,
+          evidence: preserveOwner
             ? {
               ...(existing.evidence ?? {}),
               ...(input.evidence ?? {}),
             }
             : input.evidence ?? existing.evidence,
-          nextAction: input.preserveExistingOwner ? existing.nextAction : input.nextAction,
-          wakePolicy: input.preserveExistingOwner
+          nextAction: preserveOwner ? existing.nextAction : input.nextAction,
+          wakePolicy: preserveOwner
             ? existing.wakePolicy
             : input.wakePolicy ?? null,
-          monitorPolicy: input.preserveExistingOwner
+          monitorPolicy: preserveOwner
             ? existing.monitorPolicy
             : input.monitorPolicy ?? null,
           attemptCount: input.attemptCount ?? existing.attemptCount + 1,
-          maxAttempts: input.preserveExistingOwner
+          maxAttempts: preserveOwner
             ? existing.maxAttempts
             : input.maxAttempts ?? null,
-          timeoutAt: input.preserveExistingOwner
+          timeoutAt: preserveOwner
             ? asDatabaseDate(existing.timeoutAt)
             : input.timeoutAt ?? null,
-          lastAttemptAt: input.preserveExistingOwner
+          lastAttemptAt: preserveOwner
             ? asDatabaseDate(existing.lastAttemptAt)
             : input.lastAttemptAt ?? now,
-          outcome: input.preserveExistingOwner ? existing.outcome : null,
-          resolutionNote: input.preserveExistingOwner ? existing.resolutionNote : null,
+          outcome: preserveOwner ? existing.outcome : null,
+          resolutionNote: preserveOwner ? existing.resolutionNote : null,
           resolvedAt: null,
           updatedAt: now,
         })

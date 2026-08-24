@@ -17,7 +17,34 @@ export const DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS = 1;
 export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
   "Paperclip needs a disposition before this issue can continue.";
 export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY =
-  "Paperclip could not resolve this issue's missing disposition automatically. The source assignment is unchanged and a board decision is required.";
+  "Paperclip could not resolve this issue's missing disposition automatically. Recovery is exhausted and waiting on a board owner; this is not a live agent wake path.";
+
+export type SuccessfulRunHandoffAttemptEvidence = {
+  handoffAttempt: number;
+  maxHandoffAttempts: number;
+  exhausted?: boolean;
+};
+
+const LIVE_SOURCE_STATUSES = new Set(["todo", "in_progress", "in_review"]);
+
+export function isSuccessfulRunHandoffAttemptExhausted(
+  evidence: SuccessfulRunHandoffAttemptEvidence | null | undefined,
+): boolean {
+  if (!evidence) return false;
+  if (typeof evidence.exhausted === "boolean") return evidence.exhausted;
+  return evidence.handoffAttempt >= evidence.maxHandoffAttempts;
+}
+
+export function recoveryIssueStatusForExhaustedMissingDisposition(input: {
+  unresolvedBlockerCount: number;
+  currentStatus: string;
+}): "blocked" | "todo" | "in_progress" | "in_review" {
+  if (input.unresolvedBlockerCount > 0) return "blocked";
+  if (LIVE_SOURCE_STATUSES.has(input.currentStatus)) {
+    return input.currentStatus as "todo" | "in_progress" | "in_review";
+  }
+  return "todo";
+}
 export const LEGACY_SUCCESSFUL_RUN_HANDOFF_NOTICE_PREFIXES = [
   "## This issue still needs a next step",
   "## Successful run missing issue disposition",
@@ -205,7 +232,7 @@ export function buildSuccessfulRunHandoffExhaustedNotice(input: {
     body: SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
     presentation: systemNoticePresentation({
       tone: "danger",
-      title: "Missing disposition recovery blocked",
+      title: "Missing disposition recovery exhausted",
     }),
     metadata: {
       version: 1,
@@ -222,6 +249,7 @@ export function buildSuccessfulRunHandoffExhaustedNotice(input: {
               ? agentLinkRow("Recovery owner", input.recoveryOwner)
               : keyValueRow("Recovery owner", "Board decision required"),
             agentLinkRow("Source assignee", input.sourceAssignee),
+            keyValueRow("Wake path", "exhausted — not a live agent wake"),
             keyValueRow("Suggested action", "inspect the evidence, then retry the original owner, explicitly reassign, or record a valid issue disposition"),
           ],
         },

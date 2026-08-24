@@ -10,10 +10,12 @@ import {
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
+  isSuccessfulRunHandoffAttemptExhausted,
   isSuccessfulRunHandoffValidPathSkip,
   isPluginManagedIssueLifecycle,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  recoveryIssueStatusForExhaustedMissingDisposition,
 } from "./successful-run-handoff.js";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 
@@ -66,6 +68,65 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     ...overrides,
   });
 }
+
+describe("exhausted missing-disposition recovery semantics", () => {
+  it("treats handoffAttempt at maxHandoffAttempts as exhausted", () => {
+    expect(isSuccessfulRunHandoffAttemptExhausted({
+      handoffAttempt: 1,
+      maxHandoffAttempts: 1,
+    })).toBe(true);
+    expect(isSuccessfulRunHandoffAttemptExhausted({
+      handoffAttempt: 1,
+      maxHandoffAttempts: 2,
+    })).toBe(false);
+    expect(isSuccessfulRunHandoffAttemptExhausted({
+      handoffAttempt: 1,
+      maxHandoffAttempts: 2,
+      exhausted: true,
+    })).toBe(true);
+  });
+
+  it("does not present exhausted recovery as a live agent park when a release already restored a live status", () => {
+    expect(recoveryIssueStatusForExhaustedMissingDisposition({
+      unresolvedBlockerCount: 0,
+      currentStatus: "in_progress",
+    })).toBe("in_progress");
+    expect(recoveryIssueStatusForExhaustedMissingDisposition({
+      unresolvedBlockerCount: 0,
+      currentStatus: "todo",
+    })).toBe("todo");
+    expect(recoveryIssueStatusForExhaustedMissingDisposition({
+      unresolvedBlockerCount: 0,
+      currentStatus: "blocked",
+    })).toBe("todo");
+    expect(recoveryIssueStatusForExhaustedMissingDisposition({
+      unresolvedBlockerCount: 1,
+      currentStatus: "in_progress",
+    })).toBe("blocked");
+  });
+
+  it("names board ownership and denies a live agent wake in the exhausted notice", () => {
+    const notice = buildSuccessfulRunHandoffExhaustedNotice({
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Finish backend handoff", status: "in_progress" },
+      sourceRun: { id: "run-1", status: "succeeded", agentId: "agent-1" },
+      correctiveRun: { id: "run-2", status: "succeeded", agentId: "agent-1" },
+      sourceAssignee: { id: "agent-1", name: "CodexCoder" },
+      recoveryIssue: null,
+      recoveryActionId: "action-1",
+      recoveryOwner: null,
+      latestIssueStatus: "in_progress",
+      latestHandoffRunStatus: "succeeded",
+      missingDisposition: "clear_next_step",
+    });
+    expect(notice.body).toBe(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY);
+    expect(notice.body).not.toContain("blocked on a recovery owner");
+    expect(notice.presentation).toMatchObject({ title: "Missing disposition recovery exhausted" });
+    expect(notice.metadata.sections?.[0]?.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "key_value", label: "Recovery owner", value: "board" }),
+      expect.objectContaining({ type: "key_value", label: "Wake path", value: "exhausted — not a live agent wake" }),
+    ]));
+  });
+});
 
 describe("successful run handoff decision", () => {
   it("queues one normal-model corrective wake to the original agent when a successful run has no disposition", () => {

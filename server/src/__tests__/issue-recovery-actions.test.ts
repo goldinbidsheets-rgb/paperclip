@@ -117,6 +117,61 @@ describe("issueRecoveryActionService", () => {
     expect(fakeDb.update).toHaveBeenCalledTimes(1);
     expect(fakeDb.insert).toHaveBeenCalledTimes(1);
   });
+
+  it("persists an explicit escalated status instead of forcing active", async () => {
+    const createdRow = makeRecoveryActionRow({
+      id: "escalated-action",
+      status: "escalated",
+      ownerType: "board",
+      ownerAgentId: null,
+      maxAttempts: 1,
+    });
+    const fakeDb = {
+      select: vi.fn(() => ({
+        from() {
+          return this;
+        },
+        where() {
+          return this;
+        },
+        orderBy() {
+          return this;
+        },
+        limit() {
+          return Promise.resolve([]);
+        },
+      })),
+      insert: vi.fn(() => ({
+        values: vi.fn((values: Record<string, unknown>) => {
+          expect(values).toMatchObject({
+            status: "escalated",
+            ownerType: "board",
+            ownerAgentId: null,
+            maxAttempts: 1,
+          });
+          return {
+            returning: vi.fn(async () => [createdRow]),
+          };
+        }),
+      })),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "missing_disposition",
+      status: "escalated",
+      ownerType: "board",
+      ownerAgentId: null,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:exhausted",
+      nextAction: "Choose a valid issue disposition.",
+      maxAttempts: 1,
+    });
+
+    expect(result).toMatchObject({ id: "escalated-action", status: "escalated" });
+    expect(fakeDb.insert).toHaveBeenCalledTimes(1);
+  });
 });
 
 if (!embeddedPostgresSupport.supported) {

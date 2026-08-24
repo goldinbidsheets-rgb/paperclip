@@ -62,7 +62,9 @@ import {
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
   isPluginManagedIssueLifecycle,
+  isSuccessfulRunHandoffAttemptExhausted,
   noticeMetadataReferencesRecoveryAction,
+  recoveryIssueStatusForExhaustedMissingDisposition,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import {
@@ -191,6 +193,7 @@ type SuccessfulRunHandoffRecoveryEvidence = {
   missingDisposition: string;
   handoffAttempt: number;
   maxHandoffAttempts: number;
+  exhausted?: boolean;
 };
 
 function compactRecoveryPresentation(title: string): IssueCommentPresentation {
@@ -568,6 +571,14 @@ function isExhaustedSuccessfulRunHandoff(latestRun: LatestIssueRun) {
   if (!evidence) return null;
   if (evidence.handoffAttempt < evidence.maxHandoffAttempts) return { ...evidence, exhausted: false };
   return { ...evidence, exhausted: true };
+}
+
+function isExhaustedMissingDispositionRecovery(
+  recoveryCause: StrandedRecoveryCause,
+  evidence?: SuccessfulRunHandoffRecoveryEvidence | null,
+) {
+  return recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+    && isSuccessfulRunHandoffAttemptExhausted(evidence);
 }
 
 function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -2634,6 +2645,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       latestRun: input.latestRun,
     });
     const isProviderQuotaWait = recoveryCause === "provider_quota";
+    const exhaustedMissingDisposition = isExhaustedMissingDispositionRecovery(
+      recoveryCause,
+      input.successfulRunHandoffEvidence,
+    );
     const now = new Date();
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
@@ -2645,6 +2660,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       supersedeOnIdentityChange: recoveryCause === "configuration_incomplete",
       preserveExistingOwner: true,
       kind: strandedRecoveryActionKind(recoveryCause),
+      status: exhaustedMissingDisposition ? "escalated" : "active",
       ownerType: isProviderQuotaWait ? "system" : "board",
       ownerAgentId: null,
       ownerUserId: null,
@@ -2664,6 +2680,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           recoveryCause,
           successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
         }),
+        exhausted: exhaustedMissingDisposition,
         failureSummary: summarizeRunFailureForIssueComment(input.latestRun)?.trim() ?? null,
       },
       evidenceOnCreate: isProviderQuotaWait
@@ -2693,6 +2710,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           type: "monitor_only",
           reason: recoveryCause,
         }
+        : exhaustedMissingDisposition
+        ? {
+          type: "board_escalation",
+          reason: "successful_run_handoff_exhausted",
+          preservesSourceAssignee: true,
+        }
         : {
           type: "board_escalation",
           reason: recoveryCause,
@@ -2701,7 +2724,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       monitorPolicy: isProviderQuotaWait
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      maxAttempts: null,
+      maxAttempts: input.successfulRunHandoffEvidence?.maxHandoffAttempts ?? null,
       lastAttemptAt: now,
     });
 
@@ -3750,8 +3773,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const exhaustedMissingDisposition = isExhaustedMissingDispositionRecovery(
+      recoveryCause,
+      input.successfulRunHandoffEvidence,
+    );
+    const targetStatus = exhaustedMissingDisposition
+      ? recoveryIssueStatusForExhaustedMissingDisposition({
+          unresolvedBlockerCount: blockerIds.length,
+          currentStatus: input.issue.status,
+        })
+      : "blocked";
     const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
+      status: targetStatus,
       blockedByIssueIds: blockerIds,
     });
     if (!updated) return null;
