@@ -35,6 +35,116 @@ export function isSuccessfulRunHandoffAttemptExhausted(
   return evidence.handoffAttempt >= evidence.maxHandoffAttempts;
 }
 
+export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_WAKE_POLICY = {
+  type: "board_escalation",
+  reason: "successful_run_handoff_exhausted",
+} as const;
+
+export type RecoveryActionExhaustionSource = {
+  status: string;
+  cause: string;
+  ownerType?: string | null;
+  ownerAgentId?: string | null;
+  evidence?: unknown;
+  maxAttempts?: number | null;
+  wakePolicy?: unknown;
+};
+
+function readFiniteInt(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.trunc(value);
+}
+
+function readEvidenceRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function readWakePolicyType(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const type = (value as Record<string, unknown>).type;
+  return typeof type === "string" && type.trim().length > 0 ? type.trim() : null;
+}
+
+export function successfulRunHandoffEvidenceFromRecoveryAction(
+  action: RecoveryActionExhaustionSource | null | undefined,
+): SuccessfulRunHandoffAttemptEvidence | null {
+  if (!action || action.cause !== SUCCESSFUL_RUN_MISSING_STATE_REASON) return null;
+  const evidence = readEvidenceRecord(action.evidence);
+  const handoffAttempt = readFiniteInt(evidence.handoffAttempt);
+  const maxHandoffAttempts = readFiniteInt(evidence.maxHandoffAttempts)
+    ?? readFiniteInt(action.maxAttempts);
+  if (typeof evidence.exhausted === "boolean") {
+    return {
+      handoffAttempt: handoffAttempt ?? 1,
+      maxHandoffAttempts: maxHandoffAttempts ?? DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
+      exhausted: evidence.exhausted,
+    };
+  }
+  if (handoffAttempt == null || maxHandoffAttempts == null) return null;
+  return { handoffAttempt, maxHandoffAttempts };
+}
+
+export function isPersistedExhaustedMissingDispositionAction(
+  action: RecoveryActionExhaustionSource | null | undefined,
+): boolean {
+  return isSuccessfulRunHandoffAttemptExhausted(
+    successfulRunHandoffEvidenceFromRecoveryAction(action),
+  );
+}
+
+export function exhaustedMissingDispositionNormalizationPatch() {
+  return {
+    status: "escalated" as const,
+    ownerType: "board" as const,
+    ownerAgentId: null,
+    wakePolicy: {
+      type: SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_WAKE_POLICY.type,
+      reason: SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_WAKE_POLICY.reason,
+    },
+  };
+}
+
+export function needsExhaustedMissingDispositionNormalization(
+  action: RecoveryActionExhaustionSource | null | undefined,
+): boolean {
+  if (!isPersistedExhaustedMissingDispositionAction(action) || !action) return false;
+  const patch = exhaustedMissingDispositionNormalizationPatch();
+  return action.status !== patch.status
+    || action.ownerType !== patch.ownerType
+    || Boolean(action.ownerAgentId)
+    || readWakePolicyType(action.wakePolicy) !== patch.wakePolicy.type;
+}
+
+export type BoardAttentionRecoveryActionPresentation = {
+  status: "active" | "escalated";
+  ownerType: "user" | "board";
+  exhausted: boolean;
+  whyNow: string;
+  severity: "high" | "medium";
+};
+
+export function presentRecoveryActionForBoardAttention(
+  action: RecoveryActionExhaustionSource,
+): BoardAttentionRecoveryActionPresentation | null {
+  const exhausted = isPersistedExhaustedMissingDispositionAction(action);
+  const normalized = needsExhaustedMissingDispositionNormalization(action)
+    ? { ...action, ...exhaustedMissingDispositionNormalizationPatch() }
+    : action;
+  if (normalized.status !== "active" && normalized.status !== "escalated") return null;
+  if (normalized.ownerType !== "user" && normalized.ownerType !== "board") return null;
+  return {
+    status: normalized.status,
+    ownerType: normalized.ownerType,
+    exhausted,
+    whyNow: normalized.status === "escalated"
+      ? "Recovery action escalated to a human owner."
+      : "Recovery action is assigned to a human owner.",
+    severity: normalized.status === "escalated" ? "high" : "medium",
+  };
+}
+
 export function recoveryIssueStatusForExhaustedMissingDisposition(input: {
   unresolvedBlockerCount: number;
   currentStatus: string;

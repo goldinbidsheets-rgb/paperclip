@@ -4079,6 +4079,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    const exhaustedMissingDisposition = await recoveryActionsSvc.normalizeExhaustedMissingDispositionActions();
     const candidates = await db
       .select()
       .from(issues)
@@ -4103,6 +4104,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
+      exhaustedMissingDispositionNormalized: exhaustedMissingDisposition.normalized,
       reviewParticipantRequeued: 0,
       escalated: 0,
       waitingOnReviewResolved: 0,

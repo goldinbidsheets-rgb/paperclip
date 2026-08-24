@@ -8,6 +8,12 @@ import type {
   IssueRecoveryActionOutcome,
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
+import {
+  SUCCESSFUL_RUN_MISSING_STATE_REASON,
+  exhaustedMissingDispositionNormalizationPatch,
+  needsExhaustedMissingDispositionNormalization,
+  successfulRunHandoffEvidenceFromRecoveryAction,
+} from "./recovery/successful-run-handoff.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
@@ -413,10 +419,72 @@ export function issueRecoveryActionService(db: Db) {
     return updated ? toReadModel(updated) : null;
   }
 
+  async function normalizeExhaustedMissingDispositionActions(): Promise<{
+    scanned: number;
+    normalized: number;
+    actionIds: string[];
+  }> {
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          eq(issueRecoveryActions.cause, SUCCESSFUL_RUN_MISSING_STATE_REASON),
+        ),
+      );
+    const result = {
+      scanned: rows.length,
+      normalized: 0,
+      actionIds: [] as string[],
+    };
+
+    for (const row of rows) {
+      const action = toReadModel(row);
+      if (!needsExhaustedMissingDispositionNormalization(action)) continue;
+      const patch = exhaustedMissingDispositionNormalizationPatch();
+      const attemptEvidence = successfulRunHandoffEvidenceFromRecoveryAction(action);
+      const now = new Date();
+      const [updated] = await db
+        .update(issueRecoveryActions)
+        .set({
+          status: patch.status,
+          ownerType: patch.ownerType,
+          ownerAgentId: patch.ownerAgentId,
+          previousOwnerAgentId: action.previousOwnerAgentId ?? action.ownerAgentId,
+          wakePolicy: patch.wakePolicy,
+          evidence: {
+            ...action.evidence,
+            exhausted: true,
+            ...(attemptEvidence
+              ? {
+                handoffAttempt: attemptEvidence.handoffAttempt,
+                maxHandoffAttempts: attemptEvidence.maxHandoffAttempts,
+              }
+              : {}),
+          },
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issueRecoveryActions.id, action.id),
+            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          ),
+        )
+        .returning({ id: issueRecoveryActions.id });
+      if (!updated) continue;
+      result.normalized += 1;
+      result.actionIds.push(updated.id);
+    }
+
+    return result;
+  }
+
   return {
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
     upsertSourceScoped,
+    normalizeExhaustedMissingDispositionActions,
   };
 }
