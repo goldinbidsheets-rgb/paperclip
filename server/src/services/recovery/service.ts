@@ -913,7 +913,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { consecutive, latestFinishedAt };
   }
 
-  async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
+  async function hasActiveExecutionPath(
+    companyId: string,
+    issueId: string,
+    agentId?: string | null,
+    opts?: { ignoreProviderQuotaRetries?: boolean },
+  ) {
     const [run, deferredWake] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
@@ -924,6 +929,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             agentId ? eq(heartbeatRuns.agentId, agentId) : sql`true`,
+            opts?.ignoreProviderQuotaRetries
+              ? sql`(
+                ${heartbeatRuns.status} <> 'scheduled_retry'
+                OR ${heartbeatRuns.scheduledRetryReason} IS DISTINCT FROM 'provider_quota_recovery'
+              )`
+              : sql`true`,
           ),
         )
         .limit(1)
@@ -2753,23 +2764,85 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .then((rows) => rows[0] ?? null);
 
       if (existing) {
-        if (input.actionId) {
-          const existingRetryAt = existing.scheduledRetryAt ?? retryAt;
+        const existingRetryAt = existing.scheduledRetryAt ?? retryAt;
+        const nextRetryAt = existingRetryAt.getTime() >= retryAt.getTime() ? existingRetryAt : retryAt;
+        const sameRun = Boolean(input.latestRun?.id) && existing.retryOfRunId === input.latestRun.id;
+        const sameTime = nextRetryAt.getTime() === existingRetryAt.getTime();
+        if (sameRun && sameTime) {
+          if (input.actionId) {
+            await tx
+              .update(issueRecoveryActions)
+              .set({
+                monitorPolicy: {
+                  type: "wait_recovery",
+                  retryAgentId: input.agentId,
+                  scheduledRunId: existing.id,
+                  retryAt: existingRetryAt.toISOString(),
+                },
+                timeoutAt: existingRetryAt,
+                updatedAt: now,
+              })
+              .where(eq(issueRecoveryActions.id, input.actionId));
+          }
+          return { run: existing, created: false };
+        }
+
+        const nextContext = withRecoveryModelProfileHint({
+          ...parseObject(existing.contextSnapshot),
+          issueId: input.issue.id,
+          taskId: input.issue.id,
+          wakeReason: "provider_quota_recovery",
+          retryReason: "provider_quota_recovery",
+          providerQuotaRetryNotBefore: nextRetryAt.toISOString(),
+        }, "normal_model");
+        const [updated] = await tx
+          .update(heartbeatRuns)
+          .set({
+            retryOfRunId: input.latestRun?.id ?? existing.retryOfRunId,
+            scheduledRetryAt: nextRetryAt,
+            contextSnapshot: nextContext,
+            updatedAt: now,
+          })
+          .where(eq(heartbeatRuns.id, existing.id))
+          .returning();
+        if (existing.wakeupRequestId) {
+          const [wakeup] = await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, existing.wakeupRequestId))
+            .limit(1);
+          if (wakeup) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                payload: withRecoveryModelProfileHint({
+                  ...parseObject(wakeup.payload),
+                  issueId: input.issue.id,
+                  retryOfRunId: input.latestRun?.id ?? null,
+                  retryReason: "provider_quota_recovery",
+                  providerQuotaRetryNotBefore: nextRetryAt.toISOString(),
+                }, "normal_model"),
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, wakeup.id));
+          }
+        }
+        if (input.actionId && updated) {
           await tx
             .update(issueRecoveryActions)
             .set({
               monitorPolicy: {
                 type: "wait_recovery",
                 retryAgentId: input.agentId,
-                scheduledRunId: existing.id,
-                retryAt: existingRetryAt.toISOString(),
+                scheduledRunId: updated.id,
+                retryAt: nextRetryAt.toISOString(),
               },
-              timeoutAt: existingRetryAt,
+              timeoutAt: nextRetryAt,
               updatedAt: now,
             })
             .where(eq(issueRecoveryActions.id, input.actionId));
         }
-        return { run: existing, created: false };
+        return { run: updated ?? existing, created: true };
       }
 
       const wakeup = await tx
@@ -4045,7 +4118,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (!targetAgentId || latestRun.agentId !== targetAgentId) return false;
 
     const [existing] = await db
-      .select({ id: heartbeatRuns.id })
+      .select({
+        id: heartbeatRuns.id,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
+      })
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, issue.companyId),
@@ -4055,7 +4131,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
       ))
       .limit(1);
-    return Boolean(existing);
+    if (!existing) return false;
+    // Skip only when this wait already covers the latest run, or when the
+    // latest row is the wait itself. A newer quota failure must fall through
+    // so ensureProviderQuotaWaitRecoveryRetry can re-point provenance and reset.
+    return existing.retryOfRunId === latestRun.id || existing.id === latestRun.id;
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
@@ -4152,6 +4232,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issue.companyId,
         issue.id,
         issue.status === "in_review" ? agentId : null,
+        { ignoreProviderQuotaRetries: true },
       )) {
         result.skipped += 1;
         continue;
