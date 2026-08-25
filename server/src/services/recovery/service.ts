@@ -2660,7 +2660,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       supersedeOnIdentityChange: recoveryCause === "configuration_incomplete",
       preserveExistingOwner: true,
       kind: strandedRecoveryActionKind(recoveryCause),
-      status: exhaustedMissingDisposition ? "escalated" : "active",
+      // Explicit status is reserved for the exhausted active -> escalated
+      // contract change. Passing status: "active" on every upsert disables
+      // preserveExistingOwner and rewrites owner/routing/wake/monitor.
+      ...(exhaustedMissingDisposition ? { status: "escalated" as const } : {}),
       ownerType: isProviderQuotaWait ? "system" : "board",
       ownerAgentId: null,
       ownerUserId: null,

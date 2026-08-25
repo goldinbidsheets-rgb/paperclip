@@ -296,9 +296,11 @@ export function issueRecoveryActionService(db: Db) {
       ) {
         return supersedePriorAndInsert(input, existing.id, ownerType, now, retryCount);
       }
-      // An explicit status write (exhausted -> escalated) is a contract change
-      // and must not keep a prior live-looking owner or wake policy.
-      const preserveOwner = Boolean(input.preserveExistingOwner) && input.status == null;
+      // An explicit status write is a contract change only when it actually
+      // changes status (exhausted active -> escalated). An idempotent
+      // `status: "active"` refresh must still preserve owner/wake/monitor.
+      const preserveOwner = Boolean(input.preserveExistingOwner)
+        && (input.status == null || input.status === existing.status);
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
@@ -470,7 +472,7 @@ export function issueRecoveryActionService(db: Db) {
           and(
             eq(issueRecoveryActions.id, action.id),
             eq(issueRecoveryActions.cause, SUCCESSFUL_RUN_MISSING_STATE_REASON),
-            eq(issueRecoveryActions.updatedAt, action.updatedAt),
+            eq(issueRecoveryActions.updatedAt, row.updatedAt),
             inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
           ),
         )
