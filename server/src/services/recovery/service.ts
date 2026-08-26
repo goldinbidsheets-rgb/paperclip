@@ -2766,7 +2766,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (existing) {
         const existingRetryAt = existing.scheduledRetryAt ?? retryAt;
         const nextRetryAt = existingRetryAt.getTime() >= retryAt.getTime() ? existingRetryAt : retryAt;
-        const sameRun = Boolean(input.latestRun?.id) && existing.retryOfRunId === input.latestRun.id;
+        const latestRunId = input.latestRun?.id ?? null;
+        const sameRun = latestRunId !== null && existing.retryOfRunId === latestRunId;
         const sameTime = nextRetryAt.getTime() === existingRetryAt.getTime();
         if (sameRun && sameTime) {
           if (input.actionId) {
@@ -2798,7 +2799,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         const [updated] = await tx
           .update(heartbeatRuns)
           .set({
-            retryOfRunId: input.latestRun?.id ?? existing.retryOfRunId,
+            retryOfRunId: latestRunId ?? existing.retryOfRunId,
             scheduledRetryAt: nextRetryAt,
             contextSnapshot: nextContext,
             updatedAt: now,
@@ -2818,7 +2819,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 payload: withRecoveryModelProfileHint({
                   ...parseObject(wakeup.payload),
                   issueId: input.issue.id,
-                  retryOfRunId: input.latestRun?.id ?? null,
+                  retryOfRunId: latestRunId,
                   retryReason: "provider_quota_recovery",
                   providerQuotaRetryNotBefore: nextRetryAt.toISOString(),
                 }, "normal_model"),
