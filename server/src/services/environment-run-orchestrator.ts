@@ -31,7 +31,9 @@ import {
   buildEnvironmentLeaseContext,
   type EnvironmentRuntimeLeaseRecord,
   type EnvironmentRuntimeService,
+  type ProviderResourceDisposition,
 } from "./environment-runtime.js";
+import { ENVIRONMENT_DRIVER_TRAITS } from "./environment-driver-traits.js";
 import {
   resolveEnvironmentExecutionTarget,
   resolveEnvironmentExecutionTransport,
@@ -42,7 +44,7 @@ import {
   type AdapterRemoteExecutionSpec,
   type AdapterWorkspaceRealization,
 } from "@paperclipai/adapter-utils/execution-target";
-import type { DuplexTelemetryRecorder } from "@paperclipai/adapter-utils/duplex-telemetry";
+import type { DuplexObservabilityRecorder } from "@paperclipai/adapter-utils/duplex-observability";
 import { buildWorkspaceRealizationRequest } from "./workspace-realization.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
@@ -349,11 +351,11 @@ export function environmentRunOrchestrator(
     effectiveExecutionWorkspaceMode: string | null;
     persistedExecutionWorkspace: ExecutionWorkspace | null;
     /**
-     * The host duplex telemetry recorder for this run. The orchestrator threads
+     * The host duplex observability recorder for this run. The orchestrator threads
      * it to `resolveEnvironmentExecutionTarget`, which stamps it on the sandbox
      * target. Absent keeps the safe no-op default in the bridge.
      */
-    duplexTelemetryRecorder?: DuplexTelemetryRecorder | null;
+    duplexObservabilityRecorder?: DuplexObservabilityRecorder | null;
   }): Promise<EnvironmentRealizationResult> {
     const {
       environment,
@@ -382,11 +384,7 @@ export function environmentRunOrchestrator(
     // Step 2: Realize workspace in the environment via the runtime driver
     let workspaceRealization: Record<string, unknown> = {};
     let realizedWorkspaceCwd: string | null = null;
-    if (
-      environment.driver === "local" ||
-      environment.driver === "ssh" ||
-      environment.driver === "sandbox"
-    ) {
+    if (ENVIRONMENT_DRIVER_TRAITS[environment.driver].realizesWorkspace) {
       try {
         const remoteCwd =
           typeof lease.metadata?.remoteCwd === "string" && lease.metadata.remoteCwd.trim().length > 0
@@ -522,7 +520,7 @@ export function environmentRunOrchestrator(
         leaseMetadata: (lease.metadata as Record<string, unknown> | null) ?? null,
         lease,
         environmentRuntime,
-        duplexTelemetryRecorder: input.duplexTelemetryRecorder ?? null,
+        duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
       });
       const realizationMode = workspaceRealization.mode === "in_place" ? "in_place" : "copy";
       const authoritativeRoot =
@@ -586,6 +584,17 @@ export function environmentRunOrchestrator(
     agentId: string;
     status?: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed">;
     failureReason?: string;
+    /** Explicit paperclip_runner resource lifecycle. Omitted for legacy adapters. */
+    providerResourceDisposition?: ProviderResourceDisposition;
+    nativeLifecycleTelemetry?: {
+      provider: string;
+      harness: string;
+      lifecycleMode: "per_turn" | "warm";
+      sandboxResource:
+        | "keep_running"
+        | "stop_and_reuse"
+        | "destroy_after_turn";
+    };
   }): Promise<EnvironmentReleaseResult> {
     const status = input.status ?? "released";
     const result: EnvironmentReleaseResult = { released: [], errors: [] };
@@ -596,6 +605,7 @@ export function environmentRunOrchestrator(
         input.heartbeatRunId,
         status,
         (leaseId, error) => result.errors.push({ leaseId, error }),
+        input.providerResourceDisposition,
       );
     } catch (err) {
       result.errors.push({ leaseId: "*", error: err });
@@ -624,6 +634,8 @@ export function environmentRunOrchestrator(
             status: released.lease.status,
             cleanupStatus: released.lease.cleanupStatus,
             failureReason: input.failureReason ?? released.lease.failureReason,
+            providerResourceDisposition:
+              input.providerResourceDisposition ?? "legacy_default",
           },
         });
       } catch {

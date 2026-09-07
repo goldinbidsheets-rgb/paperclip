@@ -9,6 +9,7 @@ import {
   activityLog,
   companies,
   createDb,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   environmentLeases,
   environments,
   heartbeatRuns,
@@ -17,6 +18,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -132,9 +134,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-recovery-actions-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
+    await db.delete(nativeRunFinalizations);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(environmentLeases);
@@ -270,6 +273,53 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(second.evidence).toMatchObject({ latestRunId: "run-2" });
     expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: first.id });
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
+  });
+
+  it("enforces maxAttempts once and removes every automatic recovery path", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const base = {
+      companyId,
+      sourceIssueId,
+      kind: "active_run_watchdog" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      returnOwnerAgentId: managerId,
+      cause: "process_lost",
+      fingerprint: "run-process-lost",
+      nextAction: "Resume the same run.",
+      wakePolicy: { kind: "resume_native_run", runId: "run-1" },
+      monitorPolicy: { kind: "watch_run", runId: "run-1" },
+      maxAttempts: 3,
+    };
+
+    const first = await svc.upsertSourceScoped(base);
+    const second = await svc.upsertSourceScoped(base);
+    const exhausted = await svc.upsertSourceScoped(base);
+    const replay = await svc.upsertSourceScoped(base);
+
+    expect(first.attemptCount).toBe(1);
+    expect(second.attemptCount).toBe(2);
+    expect(exhausted).toMatchObject({
+      id: first.id,
+      status: "escalated",
+      ownerType: "board",
+      ownerAgentId: null,
+      returnOwnerAgentId: managerId,
+      attemptCount: 3,
+      maxAttempts: 3,
+      wakePolicy: null,
+      monitorPolicy: null,
+      outcome: "escalated",
+      evidence: {
+        recoveryBudget: {
+          state: "exhausted",
+          attemptsUsed: 3,
+          maxAttempts: 3,
+        },
+      },
+    });
+    expect(replay).toEqual(exhausted);
   });
 
   it("preserves legacy recovery ownership when new evidence is folded into an active action", async () => {
@@ -755,6 +805,48 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(secondResult).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests)).toHaveLength(1);
+  });
+
+  it.each([
+    ["observed", "awaiting_evidence"],
+    ["observed", "awaiting_runner_reattach"],
+    ["observed", "resuming_session"],
+    ["observed", "bootstrap_incomplete"],
+    ["retryable_failure", null],
+  ] as const)("leaves quota recovery with the native owner during %s/%s", async (phase, recoveryState) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      nativeIssueId: sourceIssueId,
+      nativePhase: phase,
+      error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed",
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId,
+      companyId,
+      issueId: sourceIssueId,
+      phase,
+      recoveryState,
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.skipped).toBe(1);
+    expect(result.providerQuotaMonitored).toBe(0);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("preserves an armed business monitor while scheduling provider-quota recovery separately", async () => {
