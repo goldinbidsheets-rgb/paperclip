@@ -733,10 +733,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const result = await recovery.reconcileStrandedAssignedIssues();
 
     expect(result.operatorCancelExempted).toBe(0);
-    // The system-cancelled run still flows into the pre-existing recovery
-    // behavior (a continuation requeue or escalation — either produces a
-    // wake), proving the stand-down is scoped to operator attribution.
-    expect(enqueueWakeup).toHaveBeenCalled();
+    expect(result.escalated).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(await db.select().from(issueRecoveryActions)).toEqual([expect.objectContaining({
+      cause: "legacy_execution_requires_reconciliation", ownerType: "board", returnOwnerAgentId: coderId,
+    })]);
   });
 
   it("schedules a provider-quota retry for the original assignee without creating recovery work", async () => {
@@ -748,6 +749,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "You've hit your usage limit for GPT-5. Try again at 12:00 AM (UTC).",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -805,6 +807,73 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(secondResult).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests)).toHaveLength(1);
+  });
+
+  it.each([
+    ["unclassified", null, 0],
+    ["provider work started", { executionRecovery: { kind: "bootstrap", providerWorkStarted: true } }, 0],
+    ["exhausted bootstrap", { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }, 2],
+  ] as const)("requires reconciliation for %s quota failures without altering the business monitor", async (_label, resultJson, attempt) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const monitorAt = new Date("2099-08-25T13:00:00.000Z");
+    const executionPolicy = { mode: "normal", stages: [], commentRequired: true, monitor: {
+      kind: "external_service", nextCheckAt: monitorAt.toISOString(), notes: "Verify filing gate",
+      scheduledBy: "assignee", maxAttempts: 3, recoveryPolicy: "wake_owner",
+    } };
+    await db.update(issues).set({ executionPolicy, monitorNextCheckAt: monitorAt,
+      monitorAttemptCount: 1, monitorNotes: "Verify filing gate", monitorScheduledBy: "assignee",
+    }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: coderId,
+      invocationSource: "manual", status: "failed", resultJson, scheduledRetryAttempt: attempt,
+      error: "Provider quota exceeded for this model.", errorCode: "adapter_failed",
+      contextSnapshot: { issueId: sourceIssueId }, finishedAt: new Date(),
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const scheduleRecoveryRetry = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup, scheduleRecoveryRetry });
+
+    expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ escalated: 1, providerQuotaMonitored: 0 });
+    expect(await db.select().from(issueRecoveryActions)).toEqual([expect.objectContaining({
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation",
+      evidence: expect.objectContaining({ runId, attempt: attempt + 1 }),
+    })]);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    const [task] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(task).toMatchObject({ assigneeAgentId: coderId, executionPolicy, monitorNextCheckAt: monitorAt,
+      monitorAttemptCount: 1, monitorNotes: "Verify filing gate", monitorScheduledBy: "assignee" });
+    expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ skipped: 1, providerQuotaMonitored: 0 });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(scheduleRecoveryRetry).not.toHaveBeenCalled();
+  });
+
+  it("carries the incident retry budget through quota retries and reconciles exhaustion", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    const failure = { status: "failed", error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed", resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      finishedAt: new Date() };
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: coderId,
+      invocationSource: "manual", ...failure, contextSnapshot: { issueId: sourceIssueId } });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    for (const attempt of [1, 2]) {
+      expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ providerQuotaMonitored: 1 });
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+      expect(retry).toMatchObject({ scheduledRetryAttempt: attempt, scheduledRetryReason: "provider_quota_recovery" });
+      // Simulate the scheduled provider attempt failing before provider work starts.
+      await db.update(heartbeatRuns).set(failure).where(eq(heartbeatRuns.id, retry!.id));
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.runId, retry!.id));
+    }
+    expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ escalated: 1, providerQuotaMonitored: 0 });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"))).toHaveLength(0);
+    expect(await db.select().from(issueRecoveryActions)).toEqual([expect.objectContaining({
+      ownerType: "board", cause: "legacy_execution_requires_reconciliation", evidence: expect.objectContaining({ attempt: 3 }),
+    })]);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -882,6 +951,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-08-20T20:50:00.000Z"),
@@ -956,7 +1026,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "failed",
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
-      resultJson: { retryNotBefore: firstResetAt.toISOString() },
+      resultJson: { retryNotBefore: firstResetAt.toISOString(), executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       startedAt: new Date("2026-08-20T20:50:00.000Z"),
       finishedAt: new Date("2026-08-20T20:51:00.000Z"),
       createdAt: new Date("2026-08-20T20:51:00.000Z"),
@@ -975,9 +1045,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      scheduledRetryAttempt: 1,
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
-      resultJson: { retryNotBefore: secondResetAt.toISOString() },
+      resultJson: { retryNotBefore: secondResetAt.toISOString(), executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       startedAt: later,
       finishedAt: later,
       createdAt: later,
@@ -996,6 +1067,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       retryOfRunId: secondRunId,
       status: "scheduled_retry",
+      scheduledRetryAttempt: 2,
     });
     expect(quotaRetries[0]?.scheduledRetryAt?.getTime()).toBe(secondResetAt.getTime());
     expect(quotaRetries[0]?.contextSnapshot).toMatchObject({
@@ -1033,6 +1105,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T21:00:00.000Z"),
@@ -1067,6 +1140,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -1101,6 +1175,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -1125,7 +1200,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("schedules a quota retry for a cross-agent active review participant", async () => {
+  it.each(["bootstrap", "unclassified", "exhausted"] as const)("handles %s quota failure for a cross-agent active review participant", async (evidence) => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     const stageId = randomUUID();
     await db.update(issues).set({
@@ -1169,6 +1244,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: managerId,
       invocationSource: "automation",
       status: "failed",
+      resultJson: evidence === "unclassified" ? null : { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      scheduledRetryAttempt: evidence === "exhausted" ? 2 : 0,
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -1180,6 +1257,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     const result = await recovery.reconcileStrandedAssignedIssues();
 
+    if (evidence !== "bootstrap") {
+      expect(result).toMatchObject({ escalated: 1, providerQuotaMonitored: 0, reviewParticipantRequeued: 0 });
+      expect(await db.select().from(issueRecoveryActions)).toEqual([expect.objectContaining({
+        ownerType: "board", returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation",
+        evidence: expect.objectContaining({ runId, reviewParticipantAgentId: managerId }),
+      })]);
+      const [task] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(task).toMatchObject({ assigneeAgentId: coderId,
+        executionPolicy: reviewIssueBeforeRecovery!.executionPolicy,
+        executionState: reviewIssueBeforeRecovery!.executionState });
+      expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      return;
+    }
     expect(result).toMatchObject({ providerQuotaMonitored: 1, reviewParticipantRequeued: 0 });
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(updatedIssue).toMatchObject({
@@ -1239,6 +1331,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: managerId,
       invocationSource: "automation",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -1335,6 +1428,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "automation",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "You've hit your usage limit. Try again at 11:00 PM (UTC)",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:02:00.000Z"),
@@ -1346,7 +1440,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     const result = await recovery.reconcileStrandedAssignedIssues();
 
-    expect(result).toMatchObject({ providerQuotaMonitored: 0, reviewParticipantRequeued: 1 });
+    expect(result).toMatchObject({ providerQuotaMonitored: 0, reviewParticipantRequeued: 0, escalated: 1 });
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(updatedIssue).toMatchObject({
       status: "in_review",
@@ -1355,10 +1449,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     const [assigneeRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, assigneeRunId));
     expect(assigneeRun?.errorCode).toBe("adapter_failed");
-    expect(enqueueWakeup).toHaveBeenCalledWith(managerId, expect.objectContaining({
-      reason: "execution_review_participant_recovery",
-      payload: expect.objectContaining({ issueId: sourceIssueId, retryOfRunId: participantRunId }),
-    }));
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(await db.select().from(issueRecoveryActions)).toEqual([expect.objectContaining({
+      cause: "legacy_execution_requires_reconciliation", ownerType: "board", returnOwnerAgentId: coderId,
+      evidence: expect.objectContaining({ runId: participantRunId }),
+    })]);
   });
 
   it("blocks a cross-agent review participant with incomplete configuration", async () => {
@@ -1396,6 +1491,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: managerId,
       invocationSource: "automation",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "model_not_found: requested review model does not exist",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -1435,6 +1531,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "Provider quota exceeded for this model.",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -1471,6 +1568,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       agentId: coderId,
       invocationSource: "manual",
       status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       error: "model_not_found: requested model does not exist",
       errorCode: "adapter_failed",
       startedAt: new Date("2026-07-15T20:00:00.000Z"),
@@ -1871,6 +1969,33 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       nextAction: "Repair the worktree, then return the issue to the coder.",
       routingFallbackReason: null,
     });
+  });
+
+  it("accepts new verified evidence after an automatic no-replay disposition without reopening on duplicate requests", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "uncertain_external_action", fingerprint: runId,
+      nextAction: "Preserve recorded work without replay.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const app = createApp();
+    const body = { actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Provider receipts confirm the action was never submitted; the stopped process has no remaining effects." } };
+    // A retry without new evidence cannot clear the hold or reopen the task.
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({ ...body, executionReconciliation: undefined }).expect(200);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    const resolved = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(resolved.body.issue.status).toBe("todo");
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
+    expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId }, continuationDelivery: "pending" });
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
   });
 
   it("resolves an active recovery action and removes it from active projections", async () => {
