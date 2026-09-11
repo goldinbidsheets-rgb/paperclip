@@ -1206,6 +1206,79 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, isolatedIds))).toEqual(isolatedBefore);
   });
 
+  it.each([false, true])("preserves newest failure provenance across mixed duplicate waits (stale has latest deadline: %s)", async (staleHasLatestDeadline) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const firstFailureId = randomUUID();
+    const secondFailureId = randomUUID();
+    const resetAt = new Date("2099-01-01T20:00:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: firstFailureId, companyId, agentId: coderId, invocationSource: "manual", status: "failed",
+      error: "Provider quota exceeded for this model.", errorCode: "adapter_failed",
+      resultJson: { retryNotBefore: resetAt.toISOString(), executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: sourceIssueId },
+      createdAt: new Date("2026-08-20T20:50:00Z"),
+      startedAt: new Date("2026-08-20T20:50:00Z"), finishedAt: new Date("2026-08-20T20:51:00Z"),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    await recovery.reconcileStrandedAssignedIssues();
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+    const [originalWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, original!.wakeupRequestId!));
+    const secondCreatedAt = new Date(original!.createdAt.getTime() + 1_000);
+    await db.insert(heartbeatRuns).values({
+      id: secondFailureId, companyId, agentId: coderId, invocationSource: "manual", status: "failed",
+      error: "Provider quota exceeded for this model.", errorCode: "adapter_failed", scheduledRetryAttempt: 2,
+      resultJson: { retryNotBefore: resetAt.toISOString(), executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: sourceIssueId },
+      createdAt: secondCreatedAt, startedAt: secondCreatedAt, finishedAt: secondCreatedAt,
+    });
+    await db.update(heartbeatRuns).set({ retryOfRunId: secondFailureId, scheduledRetryAttempt: 3 }).where(eq(heartbeatRuns.id, original!.id));
+    await db.update(agentWakeupRequests).set({ payload: { ...originalWake!.payload, retryOfRunId: secondFailureId } }).where(eq(agentWakeupRequests.id, originalWake!.id));
+    const staleId = randomUUID();
+    const staleWakeId = randomUUID();
+    const staleResetAt = new Date(staleHasLatestDeadline ? "2099-01-01T21:00:00Z" : "2099-01-01T10:00:00Z");
+    await db.insert(agentWakeupRequests).values({
+      ...originalWake!, id: staleWakeId, runId: staleId, idempotencyKey: null,
+      payload: { ...originalWake!.payload, retryOfRunId: firstFailureId, providerQuotaRetryNotBefore: staleResetAt.toISOString() },
+    });
+    await db.insert(heartbeatRuns).values({
+      ...original!, id: staleId, wakeupRequestId: staleWakeId, retryOfRunId: firstFailureId,
+      scheduledRetryAt: staleResetAt, scheduledRetryAttempt: 1,
+      createdAt: new Date(secondCreatedAt.getTime() + 1_000),
+      contextSnapshot: { ...original!.contextSnapshot, providerQuotaRetryNotBefore: staleResetAt.toISOString() },
+    });
+    const beforeIssue = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const survivorId = staleHasLatestDeadline ? staleId : original!.id;
+    const cancelledId = staleHasLatestDeadline ? original!.id : staleId;
+    const safeDeadline = staleHasLatestDeadline ? staleResetAt : resetAt;
+    await recovery.reconcileStrandedAssignedIssues();
+    const runsAfter = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"));
+    expect(runsAfter.filter((run) => run.status === "scheduled_retry")).toEqual([
+      expect.objectContaining({ id: survivorId, retryOfRunId: secondFailureId, scheduledRetryAttempt: 3, scheduledRetryAt: safeDeadline }),
+    ]);
+    expect(runsAfter.find((run) => run.id === cancelledId)).toMatchObject({
+      status: "cancelled", errorCode: "provider_quota_retry_superseded",
+      retryOfRunId: staleHasLatestDeadline ? secondFailureId : firstFailureId,
+    });
+    const wakesAfter = await db.select().from(agentWakeupRequests);
+    expect(wakesAfter.filter((wake) => wake.status === "queued")).toEqual([
+      expect.objectContaining({ runId: survivorId, claimedAt: null, payload: expect.objectContaining({
+        retryOfRunId: secondFailureId, providerQuotaRetryNotBefore: safeDeadline.toISOString(),
+      }) }),
+    ]);
+    expect(wakesAfter.find((wake) => wake.runId === cancelledId)).toMatchObject({ status: "cancelled", payload: {
+      retryOfRunId: staleHasLatestDeadline ? secondFailureId : firstFailureId,
+    } });
+    const eventsAfter = await db.select().from(heartbeatRunEvents);
+    expect(eventsAfter).toHaveLength(1);
+    expect(await createRunDispatch(db).promoteScheduledRetry({ companyId, runId: cancelledId, now: new Date("2099-01-02T00:00:00Z") }))
+      .toMatchObject({ outcome: "not_promoted" });
+    await recovery.reconcileStrandedAssignedIssues();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"))).toEqual(runsAfter);
+    expect(await db.select().from(agentWakeupRequests)).toEqual(wakesAfter);
+    expect(await db.select().from(heartbeatRunEvents)).toEqual(eventsAfter);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(beforeIssue);
+  });
+
   it.each(["claimed", "queued", "running", "other_reason"])("leaves duplicate quota retries to the existing %s lifecycle", async (lifecycle) => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     const failedId = randomUUID();

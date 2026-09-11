@@ -2561,7 +2561,7 @@ export function recoveryService(
     retryAt?: Date;
   }) {
     const now = new Date();
-    const retryAt = input.retryAt ?? readProviderQuotaRetryAt(input.latestRun, now);
+    const requestedRetryAt = input.retryAt ?? readProviderQuotaRetryAt(input.latestRun, now);
     return db.transaction(async (tx) => {
       // Provider-quota waits are issue-scoped. Serialize their discovery and
       // creation so concurrent recovery sweeps cannot mint duplicate retries.
@@ -2581,15 +2581,6 @@ export function recoveryService(
         sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
       )).limit(1);
       if (active) return { run: active, created: false };
-
-      const predecessor = input.latestRun
-        ? await tx.select().from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.companyId, input.issue.companyId),
-          eq(heartbeatRuns.agentId, input.agentId),
-          eq(heartbeatRuns.id, input.latestRun.id),
-        )).then((rows) => rows[0])
-        : null;
-      const retryAttempt = executionFailureRetryCount(predecessor ?? {}) + 1;
 
       const pending = await tx
         .select()
@@ -2621,10 +2612,29 @@ export function recoveryService(
       // An unusual claimed wait needs its owning lifecycle, not a new retry.
       if (!existing && pending.length) return { run: pending[0]!, created: false };
 
+      // A later-created duplicate can reference an older failure. Resolve the
+      // newest scoped failure under the issue lock, independently of which
+      // wait wins by deadline; cancellation must not erase its provenance.
+      const predecessorIds = [...new Set([
+        ...(input.latestRun ? [input.latestRun.id] : []),
+        ...eligible.flatMap((run) => run.retryOfRunId ? [run.retryOfRunId] : []),
+      ])];
+      const predecessors = predecessorIds.length ? await tx.select().from(heartbeatRuns).where(and(
+        inArray(heartbeatRuns.id, predecessorIds),
+        eq(heartbeatRuns.companyId, input.issue.companyId), eq(heartbeatRuns.agentId, input.agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)) : [];
+      const predecessor = predecessors.find((run) => isUnsuccessfulTerminalIssueRun(run) && isProviderQuotaRecovery(run))
+        ?? predecessors.find((run) => run.id === input.latestRun?.id);
+      const latestRunId = predecessor?.id ?? null;
+      const retryAttempt = executionFailureRetryCount(predecessor ?? {}) + 1;
+      const retryAt = predecessor && predecessor.id !== input.latestRun?.id
+        ? new Date(Math.max(requestedRetryAt.getTime(), readProviderQuotaRetryAt(predecessor, now).getTime()))
+        : requestedRetryAt;
+
       if (existing) {
         const existingRetryAt = existing.scheduledRetryAt ?? retryAt;
         const nextRetryAt = new Date(Math.max(retryAt.getTime(), ...eligible.map((run) => run.scheduledRetryAt?.getTime() ?? 0)));
-        const latestRunId = input.latestRun?.id ?? null;
         const sameRun = latestRunId !== null && existing.retryOfRunId === latestRunId;
         const sameTime = existing.scheduledRetryAt !== null && nextRetryAt.getTime() === existingRetryAt.getTime();
         const nextRetryAttempt = Math.max(retryAttempt, ...eligible.map((run) => run.scheduledRetryAttempt ?? 0));
@@ -2743,7 +2753,7 @@ export function recoveryService(
           reason: "provider_quota_recovery",
           payload: withRecoveryContext({
             issueId: input.issue.id,
-            retryOfRunId: input.latestRun?.id ?? null,
+            retryOfRunId: latestRunId,
             retryReason: "provider_quota_recovery",
             providerQuotaRetryNotBefore: retryAt.toISOString(),
           }, "normal_model"),
@@ -2764,7 +2774,7 @@ export function recoveryService(
           triggerDetail: "system",
           status: "scheduled_retry",
           wakeupRequestId: wakeup.id,
-          retryOfRunId: input.latestRun?.id ?? null,
+          retryOfRunId: latestRunId,
           scheduledRetryAt: retryAt,
           scheduledRetryAttempt: retryAttempt,
           scheduledRetryReason: "provider_quota_recovery",
