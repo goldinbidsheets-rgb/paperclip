@@ -4,6 +4,7 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import {
+  chatActions,
   environmentLeases,
   heartbeatRuns,
   issueRecoveryActions,
@@ -129,11 +130,34 @@ export async function markExecutionReconciliation(
   db: Db,
   action: Pick<
     typeof issueRecoveryActions.$inferSelect,
-    "companyId" | "id" | "evidence"
+    "companyId" | "id" | "evidence" | "sourceIssueId"
   >,
   decision: ExecutionReconciliation,
   actorId: string,
+  deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
 ) {
+  if (deliveryOwner) {
+    const [retry] = await db
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.companyId, action.companyId),
+          eq(chatActions.id, deliveryOwner.actionId),
+        ),
+      );
+    if (
+      deliveryOwner.kind !== "chat_failed_run_retry" ||
+      !retry ||
+      retry.kind !== "failed_run_retry" ||
+      !["issued", "processing", "processed"].includes(retry.status) ||
+      retry.payload.version !== 1 ||
+      retry.payload.failedRunId !== decision.runId ||
+      retry.payload.issueId !== action.sourceIssueId
+    ) {
+      throw conflict("The authorized chat retry owner is no longer valid.");
+    }
+  }
   await db
     .update(nativeRunFinalizations)
     .set({
@@ -156,7 +180,8 @@ export async function markExecutionReconciliation(
           actorId,
           recordedAt: new Date().toISOString(),
         },
-        continuationDelivery: "pending",
+        continuationDelivery: deliveryOwner ? "delegated" : "pending",
+        ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
       },
     })
     .where(
@@ -186,6 +211,13 @@ export async function deliverReconciledExecutions(
       const decision = action.evidence.executionReconciliation as
         ExecutionReconciliation | undefined;
       if (!decision || !action.returnOwnerAgentId) continue;
+      const pendingDecision = and(
+        eq(issueRecoveryActions.companyId, action.companyId),
+        eq(issueRecoveryActions.id, action.id),
+        eq(issueRecoveryActions.status, "resolved"),
+        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`,
+      );
       const [task] = await db
         .select()
         .from(issues)
@@ -203,12 +235,9 @@ export async function deliverReconciledExecutions(
         await db
           .update(issueRecoveryActions)
           .set({
-            evidence: {
-              ...action.evidence,
-              continuationDelivery: "invalidated",
-            },
+            evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
           })
-          .where(eq(issueRecoveryActions.id, action.id));
+          .where(pendingDecision);
         continue;
       }
       const run = await wake(action.returnOwnerAgentId, {
@@ -239,18 +268,22 @@ export async function deliverReconciledExecutions(
               and(
                 eq(heartbeatRuns.companyId, action.companyId),
                 eq(heartbeatRuns.id, run.id),
+                eq(heartbeatRuns.agentId, action.returnOwnerAgentId!),
+                sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${action.id}`,
+                sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${decision.runId}`,
               ),
             );
           await tx
             .update(issueRecoveryActions)
             .set({
-              evidence: {
-                ...action.evidence,
-                continuationDelivery: "delivered",
-                continuationRunId: run.id,
-              },
+              evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(
+                {
+                  continuationDelivery: "delivered",
+                  continuationRunId: run.id,
+                },
+              )}::jsonb`,
             })
-            .where(eq(issueRecoveryActions.id, action.id));
+            .where(pendingDecision);
         });
     } catch {
       logger.warn(
