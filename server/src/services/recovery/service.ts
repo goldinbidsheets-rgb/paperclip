@@ -933,6 +933,7 @@ export function recoveryService(
         and(
           eq(heartbeatRuns.companyId, companyId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.errorCode} is distinct from 'provider_quota_retry_superseded'`,
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -964,6 +965,7 @@ export function recoveryService(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.errorCode} is distinct from 'provider_quota_retry_superseded'`,
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -2571,6 +2573,15 @@ export function recoveryService(
         for update
       `);
 
+      // A scheduler may have promoted a wait after the caller's active-path
+      // check. Do not create or rewrite recovery behind that queued/active run.
+      const [active] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.issue.companyId), eq(heartbeatRuns.agentId, input.agentId),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+      )).limit(1);
+      if (active) return { run: active, created: false };
+
       const predecessor = input.latestRun
         ? await tx.select().from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.issue.companyId),
@@ -2580,7 +2591,7 @@ export function recoveryService(
         : null;
       const retryAttempt = executionFailureRetryCount(predecessor ?? {}) + 1;
 
-      const existing = await tx
+      const pending = await tx
         .select()
         .from(heartbeatRuns)
         .where(and(
@@ -2590,17 +2601,60 @@ export function recoveryService(
           eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
         ))
-        .orderBy(desc(heartbeatRuns.scheduledRetryAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
+        .orderBy(desc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.id));
+
+      // Promotion/claiming also lock issue first. Lock wakes before runs to
+      // preserve that ordering, and leave claimed or started work untouched.
+      const wakeIds = pending.flatMap((run) => run.wakeupRequestId ? [run.wakeupRequestId] : []);
+      const wakes = wakeIds.length ? await tx.select().from(agentWakeupRequests)
+        .where(and(inArray(agentWakeupRequests.id, wakeIds),
+          eq(agentWakeupRequests.companyId, input.issue.companyId), eq(agentWakeupRequests.agentId, input.agentId),
+        )).orderBy(asc(agentWakeupRequests.id)).for("update") : [];
+      const eligible = pending.filter((run) => {
+        if (run.startedAt || run.processPid) return false;
+        if (!run.wakeupRequestId) return true;
+        const wake = wakes.find((row) => row.id === run.wakeupRequestId);
+        return wake?.companyId === input.issue.companyId && wake.agentId === input.agentId
+          && wake.runId === run.id && wake.status === "queued" && wake.claimedAt === null;
+      });
+      const existing = eligible[0];
+      // An unusual claimed wait needs its owning lifecycle, not a new retry.
+      if (!existing && pending.length) return { run: pending[0]!, created: false };
 
       if (existing) {
         const existingRetryAt = existing.scheduledRetryAt ?? retryAt;
-        const nextRetryAt = existingRetryAt.getTime() >= retryAt.getTime() ? existingRetryAt : retryAt;
+        const nextRetryAt = new Date(Math.max(retryAt.getTime(), ...eligible.map((run) => run.scheduledRetryAt?.getTime() ?? 0)));
         const latestRunId = input.latestRun?.id ?? null;
         const sameRun = latestRunId !== null && existing.retryOfRunId === latestRunId;
-        const sameTime = nextRetryAt.getTime() === existingRetryAt.getTime();
-        const nextRetryAttempt = Math.max(existing.scheduledRetryAttempt ?? 0, retryAttempt);
+        const sameTime = existing.scheduledRetryAt !== null && nextRetryAt.getTime() === existingRetryAt.getTime();
+        const nextRetryAttempt = Math.max(retryAttempt, ...eligible.map((run) => run.scheduledRetryAttempt ?? 0));
+        for (const redundant of eligible.slice(1)) {
+          const reason = `Duplicate provider quota retry superseded by ${existing.id}`;
+          const [cancelled] = await tx.update(heartbeatRuns).set({
+            status: "cancelled", finishedAt: now, updatedAt: now,
+            errorCode: "provider_quota_retry_superseded", error: reason,
+          }).where(and(
+            eq(heartbeatRuns.id, redundant.id), eq(heartbeatRuns.companyId, input.issue.companyId),
+            eq(heartbeatRuns.status, "scheduled_retry"), isNull(heartbeatRuns.startedAt),
+          )).returning();
+          if (!cancelled) continue;
+          if (cancelled.wakeupRequestId) {
+            await tx.update(agentWakeupRequests).set({
+              status: "cancelled", finishedAt: now, error: reason, updatedAt: now,
+            }).where(and(
+              eq(agentWakeupRequests.id, cancelled.wakeupRequestId),
+              eq(agentWakeupRequests.companyId, input.issue.companyId),
+              eq(agentWakeupRequests.agentId, input.agentId),
+              eq(agentWakeupRequests.runId, cancelled.id),
+              eq(agentWakeupRequests.status, "queued"), isNull(agentWakeupRequests.claimedAt),
+            ));
+          }
+          await appendHeartbeatRunEvent(tx as unknown as Db, {
+            companyId: cancelled.companyId, runId: cancelled.id, agentId: cancelled.agentId,
+            eventType: "lifecycle", stream: "system", level: "info", message: reason,
+            payload: { supersededByRunId: existing.id, scheduledRetryAt: cancelled.scheduledRetryAt?.toISOString(), scheduledRetryAttempt: cancelled.scheduledRetryAttempt },
+          });
+        }
         if (sameRun && sameTime && existing.scheduledRetryAttempt === nextRetryAttempt) {
           if (input.actionId) {
             await tx
@@ -4179,11 +4233,8 @@ export function recoveryService(
     const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
     if (!targetAgentId || latestRun.agentId !== targetAgentId) return false;
 
-    const [existing] = await db
-      .select({
-        id: heartbeatRuns.id,
-        retryOfRunId: heartbeatRuns.retryOfRunId,
-      })
+    const pending = await db
+      .select()
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, issue.companyId),
@@ -4192,12 +4243,23 @@ export function recoveryService(
         eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"),
         sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
       ))
-      .limit(1);
+      .orderBy(desc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.id));
+    const existing = pending.find((run) => run.retryOfRunId === latestRun.id || run.id === latestRun.id);
     if (!existing) return false;
     // Skip only when this wait already covers the latest run, or when the
     // latest row is the wait itself. A newer quota failure must fall through
     // so ensureProviderQuotaWaitRecoveryRetry can re-point provenance and reset.
-    return existing.retryOfRunId === latestRun.id || existing.id === latestRun.id;
+    if (pending.length > 1) {
+      const predecessor = existing.retryOfRunId ? await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, existing.retryOfRunId), eq(heartbeatRuns.companyId, issue.companyId),
+        eq(heartbeatRuns.agentId, targetAgentId),
+      )).then((rows) => rows[0] ?? null) : null;
+      await ensureProviderQuotaWaitRecoveryRetry({
+        issue, latestRun: predecessor, agentId: targetAgentId,
+        retryAt: readProviderQuotaRetryAt(predecessor ?? latestRun, new Date()),
+      });
+    }
+    return true;
   }
 
   async function reconcileStrandedAssignedIssues(opts?: {

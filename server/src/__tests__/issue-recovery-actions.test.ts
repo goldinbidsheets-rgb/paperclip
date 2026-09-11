@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -15,6 +15,7 @@ import {
   environmentLeases,
   environments,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueComments,
   issueInboxArchives,
   issueRecoveryActions,
@@ -32,6 +33,7 @@ import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbe
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { createRunDispatch } from "../modules/run-dispatch/index.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -145,6 +147,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(issueComments);
     await db.delete(environmentLeases);
     await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
@@ -1101,6 +1104,146 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       monitorScheduledBy: "assignee",
     });
     expect(updatedIssue?.monitorNextCheckAt?.getTime()).toBe(businessMonitorAt.getTime());
+  });
+
+  it.each([
+    { laterFailure: false, maxAttempt: 1, nullDeadline: false },
+    { laterFailure: false, maxAttempt: 3, nullDeadline: false },
+    { laterFailure: true, maxAttempt: 3, nullDeadline: false },
+    { laterFailure: false, maxAttempt: 1, nullDeadline: true },
+  ])("reconciles pre-existing duplicate quota retries ($laterFailure, $maxAttempt, null: $nullDeadline)", async ({ laterFailure, maxAttempt, nullDeadline }) => {
+    const { companyId, coderId, managerId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    const resetAt = new Date("2099-01-01T20:00:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: coderId, invocationSource: "manual", status: "failed",
+      error: "Provider quota exceeded for this model.", errorCode: "adapter_failed",
+      resultJson: { retryNotBefore: resetAt.toISOString(), executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: sourceIssueId },
+      startedAt: new Date("2026-08-20T20:50:00Z"), finishedAt: new Date("2026-08-20T20:51:00Z"),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    await recovery.reconcileStrandedAssignedIssues();
+    const [canonical] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+    const [canonicalWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, canonical!.wakeupRequestId!));
+    if (nullDeadline) {
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: null }).where(eq(heartbeatRuns.id, canonical!.id));
+    }
+    const beforeIssue = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const duplicates: Array<{ runId: string; wakeId: string }> = [];
+    for (const attempt of [1, maxAttempt]) {
+      const duplicateId = randomUUID();
+      const wakeId = randomUUID();
+      const staleReset = new Date("2099-01-01T10:00:00.000Z");
+      await db.insert(agentWakeupRequests).values({
+        ...canonicalWake!, id: wakeId, runId: duplicateId, idempotencyKey: null,
+        payload: { ...canonicalWake!.payload, providerQuotaRetryNotBefore: staleReset.toISOString() },
+      });
+      await db.insert(heartbeatRuns).values({
+        ...canonical!, id: duplicateId, wakeupRequestId: wakeId,
+        scheduledRetryAt: staleReset, scheduledRetryAttempt: attempt,
+        contextSnapshot: { ...canonical!.contextSnapshot, providerQuotaRetryNotBefore: staleReset.toISOString() },
+      });
+      duplicates.push({ runId: duplicateId, wakeId });
+    }
+    // Matching JSON alone must not widen company/agent/issue scope.
+    const other = await seedCompany();
+    const isolated = [
+      { companyId: other.companyId, agentId: other.coderId },
+      { agentId: managerId },
+      { contextSnapshot: { issueId: other.sourceIssueId } },
+    ];
+    const isolatedIds: string[] = [];
+    for (const overrides of isolated) {
+      const id = randomUUID();
+      await db.insert(heartbeatRuns).values({ ...canonical!, id, wakeupRequestId: null, createdAt: new Date("2020-01-01T00:00:00Z"), ...overrides });
+      isolatedIds.push(id);
+    }
+    const isolatedBefore = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, isolatedIds));
+    let latestRunId = runId;
+    if (laterFailure) {
+      latestRunId = randomUUID();
+      const later = new Date(Date.now() + 5_000);
+      await db.insert(heartbeatRuns).values({
+        id: latestRunId, companyId, agentId: coderId, invocationSource: "manual", status: "failed",
+        error: "Provider quota exceeded for this model.", errorCode: "adapter_failed",
+        scheduledRetryAttempt: 1,
+        resultJson: { retryNotBefore: "2099-01-01T15:00:00.000Z", executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        contextSnapshot: { issueId: sourceIssueId }, createdAt: later, startedAt: later, finishedAt: later,
+      });
+    }
+    await recovery.reconcileStrandedAssignedIssues();
+    const all = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, coderId),
+      eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${sourceIssueId}`,
+    ));
+    expect(all).toHaveLength(3);
+    expect(all.filter((run) => run.status === "scheduled_retry")).toEqual([
+      expect.objectContaining({ id: canonical!.id, retryOfRunId: latestRunId, scheduledRetryAttempt: maxAttempt, scheduledRetryAt: resetAt }),
+    ]);
+    for (const duplicate of duplicates) {
+      expect(all.find((run) => run.id === duplicate.runId)).toMatchObject({
+        status: "cancelled", errorCode: "provider_quota_retry_superseded", retryOfRunId: runId,
+        scheduledRetryAt: new Date("2099-01-01T10:00:00.000Z"),
+      });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, duplicate.wakeId));
+      expect(wake).toMatchObject({ status: "cancelled", runId: duplicate.runId, claimedAt: null });
+      expect(wake!.finishedAt).not.toBeNull();
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, duplicate.runId));
+      expect(events).toEqual([expect.objectContaining({
+        eventType: "lifecycle", payload: expect.objectContaining({ supersededByRunId: canonical!.id }),
+      })]);
+      expect(await createRunDispatch(db).promoteScheduledRetry({ companyId, runId: duplicate.runId, now: new Date("2099-01-02T00:00:00Z") }))
+        .toMatchObject({ outcome: "not_promoted" });
+    }
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, canonicalWake!.id));
+    expect(wake).toMatchObject({ status: "queued", payload: { retryOfRunId: latestRunId, providerQuotaRetryNotBefore: resetAt.toISOString() } });
+    const after = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"));
+    await recovery.reconcileStrandedAssignedIssues();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"))).toEqual(after);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(beforeIssue);
+    expect(await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, isolatedIds))).toEqual(isolatedBefore);
+  });
+
+  it.each(["claimed", "queued", "running", "other_reason"])("leaves duplicate quota retries to the existing %s lifecycle", async (lifecycle) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const failedId = randomUUID();
+    const createdAt = new Date("2026-08-20T20:51:00Z");
+    await db.insert(heartbeatRuns).values({
+      id: failedId, companyId, agentId: coderId, status: "failed", errorCode: "provider_quota",
+      resultJson: { errorFamily: "provider_quota" }, contextSnapshot: { issueId: sourceIssueId }, createdAt,
+    });
+    for (let i = 0; i < 2; i += 1) {
+      const id = randomUUID();
+      const wakeId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId, companyId, agentId: coderId, source: "automation", reason: "provider_quota_recovery",
+        status: lifecycle === "claimed" ? "claimed" : "queued",
+        claimedAt: lifecycle === "claimed" ? createdAt : null, runId: id,
+        payload: { issueId: sourceIssueId, retryOfRunId: failedId },
+      });
+      await db.insert(heartbeatRuns).values({
+        id, companyId, agentId: coderId, status: "scheduled_retry", retryOfRunId: failedId,
+        scheduledRetryAt: new Date("2099-01-01T20:00:00Z"), scheduledRetryAttempt: 1,
+        scheduledRetryReason: "provider_quota_recovery", wakeupRequestId: wakeId,
+        contextSnapshot: { issueId: sourceIssueId },
+      });
+    }
+    if (lifecycle !== "claimed") {
+      await db.insert(heartbeatRuns).values({
+        companyId, agentId: coderId, status: lifecycle === "other_reason" ? "scheduled_retry" : lifecycle,
+        scheduledRetryReason: "transient_failure", contextSnapshot: { issueId: sourceIssueId },
+        scheduledRetryAt: new Date("2099-01-01T10:00:00Z"),
+      });
+    }
+    const runsBefore = await db.select().from(heartbeatRuns);
+    const wakesBefore = await db.select().from(agentWakeupRequests);
+    const enqueueWakeup = vi.fn(async () => null);
+    await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    expect(await db.select().from(heartbeatRuns)).toEqual(runsBefore);
+    expect(await db.select().from(agentWakeupRequests)).toEqual(wakesBefore);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("schedules provider-quota recovery without changing prior monitor attempt history", async () => {
