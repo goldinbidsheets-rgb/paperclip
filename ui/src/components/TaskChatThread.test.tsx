@@ -1114,10 +1114,28 @@ describe("TaskChatThread runtime transcript selection", () => {
       adapterType: "claude_local", createdAt: "2026-08-25T18:00:00.000Z",
       startedAt: null, finishedAt: "2026-08-25T18:00:00.012Z",
     }]} />);
-    expect(container.textContent).toContain("Couldn't start");
+    expect(container.textContent).toContain("Waiting to resume");
     expect(container.textContent).not.toContain("No user-facing response");
     expect(container.textContent).not.toContain("Run completed");
     expect(container.querySelector(".text-destructive")).toBeNull();
+  });
+
+  it.each(["legacy", "native"] as const)("groups repeated %s pre-start holds without hiding executed work", (runtimeMode) => {
+    const heldRun = (id: string, recoveryActionId: string, startedAt: string | null = null) => ({
+      runId: id, runtimeMode, status: "cancelled", errorCode: "execution_reconciliation_required",
+      agentId: "agent-1", adapterType: runtimeMode === "native" ? "paperclip_runner" : "claude_local",
+      createdAt: "2026-09-10T18:00:00.000Z", finishedAt: "2026-09-10T18:00:01.000Z", startedAt,
+      resultJson: { executionWait: { recoveryActionId } },
+    });
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} linkedRuns={[
+      ...Array.from({ length: 100 }, (_, i) => heldRun(`wait-${i}`, "hold-1")),
+      heldRun("ran", "hold-1", "2026-09-10T18:00:00.500Z"),
+      heldRun("new-hold", "hold-2"),
+      heldRun("same-new-hold", "hold-2"),
+    ]} />);
+    expect(container.textContent?.match(/Waiting to resume/g)).toHaveLength(2);
+    expect(container.textContent).not.toContain("Couldn't start");
+    expect(container.textContent).toContain(runtimeMode === "native" ? "Run cancelled" : "Stopped");
   });
 
   it("shows cancellation after native progress without offering a retry", () => {
@@ -2782,6 +2800,41 @@ describe("TaskChatThread Paperclip Runner queue", () => {
   function occurrenceCount(text: string) {
     return container.textContent?.split(text).length! - 1;
   }
+
+  it("hides queued actions while paused and restores the queue after resume", () => {
+    const onSteerQueuedComment = vi.fn(async () => {});
+    const props = {
+      comments: [queuedComment],
+      onAdd: async () => {},
+      queuedCommentQueue: queue,
+      onEditQueuedComment: async () => {},
+      onReorderQueuedComments: async () => {},
+      onSteerQueuedComment,
+      onDiscardQueuedComment: async () => {},
+    };
+    render(<TaskChatThread {...props} />);
+    expect(container.querySelector('[data-testid="task-chat-queued-messages"]')).not.toBeNull();
+
+    render(<TaskChatThread {...props} composerPause={{ scope: "leaf", onResume: () => {} }} />);
+    expect(container.querySelector('[data-testid="paused-composer-takeover"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-queued-messages"]')).toBeNull();
+    expect(onSteerQueuedComment).not.toHaveBeenCalled();
+
+    render(<TaskChatThread {...props} />);
+    expect(container.querySelector('[data-testid="task-chat-queued-messages"]')).not.toBeNull();
+    expect(occurrenceCount(queuedComment.body)).toBe(1);
+  });
+
+  it("hides legacy transcript interrupt actions while paused", () => {
+    render(<TaskChatThread
+      comments={[{ ...queuedComment, queueState: "queued", queueTargetRunId: "run-1" }]}
+      onAdd={async () => {}}
+      onInterruptQueued={async () => {}}
+      composerPause={{ scope: "leaf", onResume: () => {} }}
+    />);
+    expect(container.querySelector('[data-testid="paused-composer-takeover"]')).not.toBeNull();
+    expect([...container.querySelectorAll("button")].some((button) => button.textContent === "Interrupt")).toBe(false);
+  });
 
   it("suppresses the transcript echo until the queued entry is consumed", async () => {
     const props = {

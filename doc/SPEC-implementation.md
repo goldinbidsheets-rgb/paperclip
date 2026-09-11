@@ -21,6 +21,9 @@ Paperclip V1 must provide a full control-plane loop for autonomous agents:
 4. All work is tracked through tasks/comments with audit visibility.
 5. Token/cost usage is reported and budget limits can stop work.
 6. The board can intervene anywhere (pause agents/tasks, override decisions).
+   An effective task or ancestor pause replaces the message composer with an
+   amber Resume takeover. New board messages, including updates with comments,
+   are rejected until the hold is released. Drafts survive pause and resume.
 
 Success means one operator can run a small AI-native company end-to-end with clear visibility and control.
 
@@ -38,7 +41,7 @@ These decisions close open questions from `SPEC.md` for V1.
 | Communication | Tasks + comments only (no separate chat system) |
 | Task ownership | Single assignee; atomic checkout required for `in_progress` transition |
 | Task watchdogs | A task watchdog is an explicitly configured, issue-subtree-scoped verification and recovery capacity. It may restore live task paths inside the watched subtree; for issue-thread interaction resolution it is an ordinary agent subject to the same audience and containment checks, not board authority, active-run output monitoring, or general liveness recovery. |
-| Recovery | Liveness/watchdog recovery preserves explicit ownership: retry lost execution continuity where safe, otherwise open visible source-scoped recovery actions by default, use issue-backed recovery only for independent repair work, or require human escalation (see `doc/execution-semantics.md`) |
+| Recovery | Liveness/watchdog recovery preserves explicit ownership: continue interrupted local conversations with bounded fresh turns and preserved history, never replay tool calls automatically; retain native ownership and real execution gates; otherwise open visible source-scoped recovery actions by default, use issue-backed recovery only for independent repair work, or require human escalation (see `doc/execution-semantics.md`) |
 | Agent adapters | Built-in `process`, `http`, local CLI/session adapters, and OpenClaw gateway support; external adapters can also be loaded through the adapter plugin flow |
 | Plugin framework | Local/self-hosted early plugin runtime is in scope; cloud marketplace and packaged public distribution remain out of scope |
 | Auth | Mode-dependent human auth (`local_trusted` implicit board in current code; authenticated mode uses sessions), API keys for agents |
