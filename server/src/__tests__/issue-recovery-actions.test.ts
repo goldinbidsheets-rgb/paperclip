@@ -5,6 +5,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  approvals,
   agentRuntimeState,
   authUsers,
   agentWakeupRequests,
@@ -17,6 +18,8 @@ import {
   heartbeatRuns,
   heartbeatRunEvents,
   issueComments,
+  issueApprovals,
+  issueThreadInteractions,
   issueInboxArchives,
   issueRecoveryActions,
   issueRelations,
@@ -142,6 +145,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
+    await db.delete(issueThreadInteractions);
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(nativeRunFinalizations);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
@@ -887,6 +893,132 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("caps conversation quota retries across service restarts without a permanent reconciliation hold", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const resultJson = { conversationContinuation: "continue_conversation_v1", errorFamily: "provider_quota" };
+    const failure = { status: "failed", errorCode: "provider_quota", resultJson, finishedAt: new Date() };
+    await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, ...failure,
+      contextSnapshot: { issueId: sourceIssueId } });
+    const enqueueWakeup = vi.fn(async () => null);
+    for (const attempt of [1, 2]) {
+      await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+      expect(retry).toMatchObject({ scheduledRetryAttempt: attempt, resultJson: { conversationContinuation: "continue_conversation_v1" } });
+      await db.update(heartbeatRuns).set(failure).where(eq(heartbeatRuns.id, retry!.id));
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.runId, retry!.id));
+    }
+    for (let restart = 0; restart < 2; restart++) {
+      await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"))).toHaveLength(0);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    }
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    // Explicit new conversation has its own incident; exhausted history is not a hold.
+    await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, ...failure,
+      contextSnapshot: { issueId: sourceIssueId, wakeReason: "issue_commented" } });
+    await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    const [fresh] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+    expect(fresh).toMatchObject({ scheduledRetryAttempt: 1, resultJson: { conversationContinuation: "continue_conversation_v1" } });
+  });
+
+  it.each(["clear", "interaction", "exhausted"] as const)("reconciles a historical conversation quota wait with %s admission", async (admission) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const [failure] = await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, status: "failed",
+      errorCode: "provider_quota", resultJson: { conversationContinuation: "continue_conversation_v1", errorFamily: "provider_quota" },
+      contextSnapshot: { issueId: sourceIssueId }, finishedAt: new Date() }).returning();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    await recovery.reconcileStrandedAssignedIssues();
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+    await db.update(heartbeatRuns).set({ resultJson: null }).where(eq(heartbeatRuns.id, retry!.id));
+    if (admission === "interaction") await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId,
+      kind: "ask_user_questions", payload: { version: 1, questions: [{ id: "proceed", question: "Proceed?", type: "text" }] } as any });
+    if (admission === "exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, failure!.id));
+    const issueBefore = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    await recoveryService(db, { enqueueWakeup: vi.fn(async () => null) }).reconcileStrandedAssignedIssues();
+    const [updated] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retry!.id));
+    expect(updated).toMatchObject({ status: admission === "clear" ? "scheduled_retry" : "cancelled",
+      retryOfRunId: failure!.id, scheduledRetryAt: retry!.scheduledRetryAt,
+      resultJson: { conversationContinuation: "continue_conversation_v1" } });
+    if (admission !== "clear") {
+      expect(await createRunDispatch(db).promoteScheduledRetry({ companyId, runId: retry!.id, now: new Date("2099-01-01") }))
+        .toMatchObject({ outcome: "not_promoted" });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, retry!.id)))
+        .toEqual([expect.objectContaining({ status: "cancelled" })]);
+    }
+    const runsBefore = await db.select().from(heartbeatRuns);
+    const eventsBefore = await db.select().from(heartbeatRunEvents);
+    await recoveryService(db, { enqueueWakeup: vi.fn(async () => null) }).reconcileStrandedAssignedIssues();
+    expect(await db.select().from(heartbeatRuns)).toEqual(runsBefore);
+    expect(await db.select().from(heartbeatRunEvents)).toEqual(eventsBefore);
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(issueBefore);
+  });
+
+  it.each((["interaction", "approval", "dependency", "disabled", "reassigned"] as const).flatMap(
+    (gate) => [false, true].map((historical) => ({ gate, historical })),
+  ))(
+    "gates conversation quota retries on $gate at scheduling and promotion (historical: $historical)", async ({ gate, historical }) => {
+      const { companyId, coderId, managerId, sourceIssueId, sourceIssue } = await seedCompany();
+      const failedId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: failedId, companyId, agentId: coderId, status: "failed",
+        errorCode: "provider_quota", resultJson: { conversationContinuation: "continue_conversation_v1", errorFamily: "provider_quota" },
+        contextSnapshot: { issueId: sourceIssueId }, finishedAt: new Date() });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      await recovery.reconcileStrandedAssignedIssues();
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+      expect(retry).toBeDefined();
+      if (historical) await db.update(heartbeatRuns).set({ resultJson: null }).where(eq(heartbeatRuns.id, retry!.id));
+      if (gate === "interaction") {
+        await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId, kind: "ask_user_questions",
+          payload: { version: 1, questions: [{ id: "proceed", question: "Proceed?", type: "text" }] } as any });
+      } else if (gate === "approval") {
+        const [approval] = await db.insert(approvals).values({ companyId, type: "request_board_approval", payload: {} }).returning();
+        await db.insert(issueApprovals).values({ companyId, issueId: sourceIssueId, approvalId: approval!.id });
+      } else if (gate === "dependency") {
+        const [blocker] = await db.insert(issues).values({ companyId, title: "Blocker", status: "todo" }).returning();
+        await db.insert(issueRelations).values({ companyId, issueId: blocker!.id, relatedIssueId: sourceIssueId, type: "blocks" });
+      } else if (gate === "disabled") {
+        await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: false } } }).where(eq(agents.id, coderId));
+      } else {
+        await db.update(issues).set({ assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+      }
+      const [gatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      const promotion = await createRunDispatch(db).promoteScheduledRetry({ companyId, runId: retry!.id, now: new Date("2099-01-01") });
+      expect(promotion.outcome).toBe("gate_suppressed");
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, retry!.id));
+      expect(wake?.status).toBe("cancelled");
+      // Remove only the synthetic cancelled retry so the same failure is considered for scheduling again.
+      await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, retry!.id));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, retry!.id));
+      await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
+      await recoveryService(db, { enqueueWakeup: vi.fn(async () => null) }).reconcileStrandedAssignedIssues();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"))).toHaveLength(0);
+      expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual([gatedIssue]);
+      expect(sourceIssue.monitorNotes).toBeNull();
+    },
+  );
+
+  it("refuses exhausted historical conversation quota promotion without waiting for a sweep", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const [failure] = await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, status: "failed",
+      errorCode: "provider_quota", resultJson: { conversationContinuation: "continue_conversation_v1", errorFamily: "provider_quota" },
+      contextSnapshot: { issueId: sourceIssueId }, finishedAt: new Date() }).returning();
+    await recoveryService(db, { enqueueWakeup: vi.fn(async () => null) }).reconcileStrandedAssignedIssues();
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+    await db.update(heartbeatRuns).set({ resultJson: null, scheduledRetryAttempt: 3 }).where(eq(heartbeatRuns.id, retry!.id));
+    await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, failure!.id));
+    const dispatch = createRunDispatch(db);
+    expect(await dispatch.promoteScheduledRetry({ companyId, runId: retry!.id, now: new Date("2099-01-01") }))
+      .toMatchObject({ outcome: "gate_suppressed", errorCode: "provider_quota_retry_exhausted" });
+    expect(await dispatch.promoteScheduledRetry({ companyId, runId: retry!.id, now: new Date("2099-01-01") }))
+      .toMatchObject({ outcome: "not_promoted" });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, retry!.id)))
+      .toEqual([expect.objectContaining({ status: "cancelled" })]);
+    await recoveryService(db, { enqueueWakeup: vi.fn(async () => null) }).reconcileStrandedAssignedIssues();
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"))).toHaveLength(0);
+  });
+
   it.each([
     ["observed", "awaiting_evidence"],
     ["observed", "awaiting_runner_reattach"],
@@ -1254,6 +1386,79 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const runsAfter = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"));
     expect(runsAfter.filter((run) => run.status === "scheduled_retry")).toEqual([
       expect.objectContaining({ id: survivorId, retryOfRunId: secondFailureId, scheduledRetryAttempt: 3, scheduledRetryAt: safeDeadline }),
+    ]);
+    expect(runsAfter.find((run) => run.id === cancelledId)).toMatchObject({
+      status: "cancelled", errorCode: "provider_quota_retry_superseded",
+      retryOfRunId: staleHasLatestDeadline ? secondFailureId : firstFailureId,
+    });
+    const wakesAfter = await db.select().from(agentWakeupRequests);
+    expect(wakesAfter.filter((wake) => wake.status === "queued")).toEqual([
+      expect.objectContaining({ runId: survivorId, claimedAt: null, payload: expect.objectContaining({
+        retryOfRunId: secondFailureId, providerQuotaRetryNotBefore: safeDeadline.toISOString(),
+      }) }),
+    ]);
+    expect(wakesAfter.find((wake) => wake.runId === cancelledId)).toMatchObject({ status: "cancelled", payload: {
+      retryOfRunId: staleHasLatestDeadline ? secondFailureId : firstFailureId,
+    } });
+    const eventsAfter = await db.select().from(heartbeatRunEvents);
+    expect(eventsAfter).toHaveLength(1);
+    expect(await createRunDispatch(db).promoteScheduledRetry({ companyId, runId: cancelledId, now: new Date("2099-01-02T00:00:00Z") }))
+      .toMatchObject({ outcome: "not_promoted" });
+    await recovery.reconcileStrandedAssignedIssues();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"))).toEqual(runsAfter);
+    expect(await db.select().from(agentWakeupRequests)).toEqual(wakesAfter);
+    expect(await db.select().from(heartbeatRunEvents)).toEqual(eventsAfter);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(beforeIssue);
+  });
+
+  it.each([false, true])("preserves mixed predecessor provenance for conversation quota waits (stale has latest deadline: %s)", async (staleHasLatestDeadline) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const firstFailureId = randomUUID();
+    const secondFailureId = randomUUID();
+    const resetAt = new Date("2099-01-01T20:00:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: firstFailureId, companyId, agentId: coderId, invocationSource: "manual", status: "failed",
+      error: "Provider quota exceeded for this model.", errorCode: "adapter_failed",
+      resultJson: { conversationContinuation: "continue_conversation_v1", retryNotBefore: resetAt.toISOString(), executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: sourceIssueId },
+      createdAt: new Date("2026-08-20T20:50:00Z"),
+      startedAt: new Date("2026-08-20T20:50:00Z"), finishedAt: new Date("2026-08-20T20:51:00Z"),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    await recovery.reconcileStrandedAssignedIssues();
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
+    const [originalWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, original!.wakeupRequestId!));
+    const secondCreatedAt = new Date(original!.createdAt.getTime() + 1_000);
+    await db.insert(heartbeatRuns).values({
+      id: secondFailureId, companyId, agentId: coderId, invocationSource: "manual", status: "failed",
+      error: "Provider quota exceeded for this model.", errorCode: "adapter_failed", scheduledRetryAttempt: 1,
+      resultJson: { conversationContinuation: "continue_conversation_v1", retryNotBefore: resetAt.toISOString(), executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: sourceIssueId },
+      createdAt: secondCreatedAt, startedAt: secondCreatedAt, finishedAt: secondCreatedAt,
+    });
+    await db.update(heartbeatRuns).set({ retryOfRunId: secondFailureId, scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, original!.id));
+    await db.update(agentWakeupRequests).set({ payload: { ...originalWake!.payload, retryOfRunId: secondFailureId } }).where(eq(agentWakeupRequests.id, originalWake!.id));
+    const staleId = randomUUID();
+    const staleWakeId = randomUUID();
+    const staleResetAt = new Date(staleHasLatestDeadline ? "2099-01-01T21:00:00Z" : "2099-01-01T10:00:00Z");
+    await db.insert(agentWakeupRequests).values({
+      ...originalWake!, id: staleWakeId, runId: staleId, idempotencyKey: null,
+      payload: { ...originalWake!.payload, retryOfRunId: firstFailureId, providerQuotaRetryNotBefore: staleResetAt.toISOString() },
+    });
+    await db.insert(heartbeatRuns).values({
+      ...original!, id: staleId, wakeupRequestId: staleWakeId, retryOfRunId: firstFailureId,
+      scheduledRetryAt: staleResetAt, scheduledRetryAttempt: 1,
+      createdAt: new Date(secondCreatedAt.getTime() + 1_000),
+      contextSnapshot: { ...original!.contextSnapshot, providerQuotaRetryNotBefore: staleResetAt.toISOString() },
+    });
+    const beforeIssue = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const survivorId = staleHasLatestDeadline ? staleId : original!.id;
+    const cancelledId = staleHasLatestDeadline ? original!.id : staleId;
+    const safeDeadline = staleHasLatestDeadline ? staleResetAt : resetAt;
+    await recovery.reconcileStrandedAssignedIssues();
+    const runsAfter = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"));
+    expect(runsAfter.filter((run) => run.status === "scheduled_retry")).toEqual([
+      expect.objectContaining({ id: survivorId, retryOfRunId: secondFailureId, scheduledRetryAttempt: 2, scheduledRetryAt: safeDeadline, resultJson: { conversationContinuation: "continue_conversation_v1" } }),
     ]);
     expect(runsAfter.find((run) => run.id === cancelledId)).toMatchObject({
       status: "cancelled", errorCode: "provider_quota_retry_superseded",

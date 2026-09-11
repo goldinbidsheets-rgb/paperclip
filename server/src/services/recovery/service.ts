@@ -77,6 +77,8 @@ import {
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
+import { CONVERSATION_CONTINUATION_POLICY, hasConversationContinuationPolicy } from "../conversation-continuation.js";
+import { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
 import {
@@ -2628,6 +2630,21 @@ export function recoveryService(
         ?? predecessors.find((run) => run.id === input.latestRun?.id);
       const latestRunId = predecessor?.id ?? null;
       const retryAttempt = executionFailureRetryCount(predecessor ?? {}) + 1;
+      const conversation = predecessor?.runtimeMode === "legacy" && hasConversationContinuationPolicy(predecessor.resultJson);
+      // This producer mints its own row rather than using heartbeat's bounded
+      // scheduler. Retain the same two-retry incident cap after conversation
+      // policy removes the legacy action-outcome reconciliation hold.
+      const exhausted = conversation && (retryAttempt > 2 || eligible.some((run) => (run.scheduledRetryAttempt ?? 0) > 2));
+      const gate = conversation && !exhausted
+        ? await createRunDispatch(tx as unknown as Db).evaluateScheduledRetryGate({
+            companyId: input.issue.companyId, runId: predecessor!.id,
+            retryReasonOverride: "provider_quota_recovery", now,
+          })
+        : null;
+      const suppression = exhausted
+        ? { errorCode: "provider_quota_retry_exhausted", reason: "Automatic provider quota retry budget exhausted" }
+        : gate && !gate.allowed ? gate : null;
+      const policyResult = conversation ? { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } : {};
       const retryAt = predecessor && predecessor.id !== input.latestRun?.id
         ? new Date(Math.max(requestedRetryAt.getTime(), readProviderQuotaRetryAt(predecessor, now).getTime()))
         : requestedRetryAt;
@@ -2638,11 +2655,12 @@ export function recoveryService(
         const sameRun = latestRunId !== null && existing.retryOfRunId === latestRunId;
         const sameTime = existing.scheduledRetryAt !== null && nextRetryAt.getTime() === existingRetryAt.getTime();
         const nextRetryAttempt = Math.max(retryAttempt, ...eligible.map((run) => run.scheduledRetryAttempt ?? 0));
-        for (const redundant of eligible.slice(1)) {
-          const reason = `Duplicate provider quota retry superseded by ${existing.id}`;
+        for (const redundant of suppression ? eligible : eligible.slice(1)) {
+          const reason = suppression?.reason ?? `Duplicate provider quota retry superseded by ${existing.id}`;
           const [cancelled] = await tx.update(heartbeatRuns).set({
             status: "cancelled", finishedAt: now, updatedAt: now,
-            errorCode: "provider_quota_retry_superseded", error: reason,
+            errorCode: suppression?.errorCode ?? "provider_quota_retry_superseded", error: reason,
+            ...(conversation ? { resultJson: { ...parseObject(redundant.resultJson), ...policyResult } } : {}),
           }).where(and(
             eq(heartbeatRuns.id, redundant.id), eq(heartbeatRuns.companyId, input.issue.companyId),
             eq(heartbeatRuns.status, "scheduled_retry"), isNull(heartbeatRuns.startedAt),
@@ -2662,10 +2680,12 @@ export function recoveryService(
           await appendHeartbeatRunEvent(tx as unknown as Db, {
             companyId: cancelled.companyId, runId: cancelled.id, agentId: cancelled.agentId,
             eventType: "lifecycle", stream: "system", level: "info", message: reason,
-            payload: { supersededByRunId: existing.id, scheduledRetryAt: cancelled.scheduledRetryAt?.toISOString(), scheduledRetryAttempt: cancelled.scheduledRetryAttempt },
+            payload: { ...(suppression ? { suppressionCode: suppression.errorCode } : { supersededByRunId: existing.id }), scheduledRetryAt: cancelled.scheduledRetryAt?.toISOString(), scheduledRetryAttempt: cancelled.scheduledRetryAttempt },
           });
         }
-        if (sameRun && sameTime && existing.scheduledRetryAttempt === nextRetryAttempt) {
+        if (suppression) return { run: existing, created: false };
+        if (sameRun && sameTime && existing.scheduledRetryAttempt === nextRetryAttempt
+            && (!conversation || hasConversationContinuationPolicy(existing.resultJson))) {
           if (input.actionId) {
             await tx
               .update(issueRecoveryActions)
@@ -2699,6 +2719,7 @@ export function recoveryService(
             scheduledRetryAt: nextRetryAt,
             scheduledRetryAttempt: nextRetryAttempt,
             contextSnapshot: nextContext,
+            ...(conversation ? { resultJson: { ...parseObject(existing.resultJson), ...policyResult } } : {}),
             updatedAt: now,
           })
           .where(eq(heartbeatRuns.id, existing.id))
@@ -2743,6 +2764,7 @@ export function recoveryService(
         return { run: updated ?? existing, created: true };
       }
 
+      if (suppression) return { run: null, created: false as const };
       const wakeup = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -2778,6 +2800,7 @@ export function recoveryService(
           scheduledRetryAt: retryAt,
           scheduledRetryAttempt: retryAttempt,
           scheduledRetryReason: "provider_quota_recovery",
+          ...(conversation ? { resultJson: policyResult } : {}),
           contextSnapshot: withRecoveryContext({
             issueId: input.issue.id,
             taskId: input.issue.id,
@@ -4194,7 +4217,7 @@ export function recoveryService(
       agentId: targetAgentId,
       retryAt: input.classification.retryAt,
     });
-    if (!scheduled.created) return null;
+    if (!scheduled.created || !scheduled.run) return null;
 
     await logActivity(db, {
       companyId: input.issue.companyId,
@@ -4259,14 +4282,19 @@ export function recoveryService(
     // Skip only when this wait already covers the latest run, or when the
     // latest row is the wait itself. A newer quota failure must fall through
     // so ensureProviderQuotaWaitRecoveryRetry can re-point provenance and reset.
-    if (pending.length > 1) {
+    // Also revisit a single historical wait: it may predate policy propagation
+    // or carry an exhausted predecessor. Read persisted evidence, never the
+    // agent's mutable adapter configuration.
+    if (pending.length > 1 || existing.retryOfRunId) {
       const predecessor = existing.retryOfRunId ? await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, existing.retryOfRunId), eq(heartbeatRuns.companyId, issue.companyId),
         eq(heartbeatRuns.agentId, targetAgentId),
       )).then((rows) => rows[0] ?? null) : null;
       await ensureProviderQuotaWaitRecoveryRetry({
         issue, latestRun: predecessor, agentId: targetAgentId,
-        retryAt: readProviderQuotaRetryAt(predecessor ?? latestRun, new Date()),
+        retryAt: pending.length > 1
+          ? readProviderQuotaRetryAt(predecessor ?? latestRun, new Date())
+          : existing.scheduledRetryAt ?? readProviderQuotaRetryAt(predecessor ?? latestRun, new Date()),
       });
     }
     return true;
@@ -4432,6 +4460,11 @@ export function recoveryService(
       }
 
       if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+        // An older quota wait may lack the conversation marker. Reconcile only
+        // an existing wait here; the pending question never authorizes a new one.
+        if (latestRun?.status === "scheduled_retry" && parseObject(latestRun.contextSnapshot).retryReason === "provider_quota_recovery") {
+          await hasPendingProviderQuotaRecoveryRetry(issue, latestRun);
+        }
         result.skipped += 1;
         continue;
       }
