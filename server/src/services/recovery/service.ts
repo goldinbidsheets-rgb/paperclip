@@ -3989,7 +3989,20 @@ export function recoveryService(
     if (episode) {
       if (!latestRun) return "skipped";
       const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
-      if (decision.kind === "skip") return "skipped";
+      if (decision.kind === "skip") {
+        if (decision.reason !== "agent_not_invokable") return "skipped";
+        // The persisted decision has already ruled out intentional waits and
+        // competing owners. Unavailable owners need intervention, not a retry.
+        const escalated = await escalateStrandedAssignedIssue({
+          issue: current,
+          previousStatus: current.status as StrandedPreviousStatus,
+          latestRun,
+          comment:
+            "Paperclip cannot safely continue automatic recovery because the original assignee is not invokable. " +
+            "The source assignment is unchanged and the board must choose the next action.",
+        });
+        return escalated ? "escalated" : "skipped";
+      }
       state.fingerprint = legacyDispositionFingerprint(current.companyId, current.id, latestRun.agentId, episode.id);
     }
     if (state.hasActiveExecutionPath) return "skipped";

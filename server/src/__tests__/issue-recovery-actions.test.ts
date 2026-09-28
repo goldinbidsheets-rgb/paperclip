@@ -11,6 +11,8 @@ import {
   approvals,
   agentRuntimeState,
   authUsers,
+  budgetPolicies,
+  costEvents,
   agentWakeupRequests,
   activityLog,
   companies,
@@ -154,6 +156,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
+    await db.delete(costEvents);
+    await db.delete(budgetPolicies);
     await db.delete(workspaceOperations);
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
@@ -265,6 +269,89 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     app.use(errorHandler);
     return app;
   }
+
+  it.each(["terminated", "paused", "pending_approval", "wake_disabled"])(
+    "escalates stranded legacy success with an unavailable owner (%s) without takeover",
+    async (unavailable) => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "succeeded" });
+      await db.update(agents).set(unavailable === "wake_disabled"
+        ? { runtimeConfig: { heartbeat: { wakeOnDemand: false } } }
+        : { status: unavailable }).where(eq(agents.id, coderId));
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ escalated: 1, issueIds: [sourceIssueId] });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: coderId, assigneeUserId: null });
+      expect(await db.select().from(issueRecoveryActions)).toEqual([expect.objectContaining({
+        sourceIssueId, ownerType: "board", ownerAgentId: null,
+        previousOwnerAgentId: coderId, returnOwnerAgentId: coderId,
+        wakePolicy: expect.objectContaining({ type: "board_escalation", preservesSourceAssignee: true }),
+      })]);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain("original assignee is not invokable");
+      // Both entry points must converge on one visible intervention, even after restart.
+      expect(await recoveryService(db, { enqueueWakeup }).reconcileLegacyContinuation(runId)).toBe("skipped");
+      expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ escalated: 0 });
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+      expect(await db.select().from(issueComments)).toEqual(comments);
+      expect(await db.select().from(heartbeatRuns)).toEqual([expect.objectContaining({ id: runId, status: "succeeded" })]);
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["interaction", "approval", "dependency", "monitor", "budget", "active_run", "reassigned", "native", "review"])(
+    "preserves the %s gate during unavailable-owner legacy reconciliation",
+    async (gate) => {
+      const { companyId, coderId, managerId, sourceIssueId } = await seedCompany();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "succeeded" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+      if (gate === "interaction") {
+        await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId, kind: "ask_user_questions",
+          payload: { version: 1, questions: [{ id: "next", question: "Choose next step", type: "text" }] } as any });
+      } else if (gate === "approval") {
+        const [approval] = await db.insert(approvals).values({ companyId, type: "request_board_approval", payload: {} }).returning();
+        await db.insert(issueApprovals).values({ companyId, issueId: sourceIssueId, approvalId: approval!.id });
+      } else if (gate === "dependency") {
+        const [blocker] = await db.insert(issues).values({ companyId, title: "Required dependency", status: "blocked" }).returning();
+        await db.insert(issueRelations).values({ companyId, issueId: blocker!.id, relatedIssueId: sourceIssueId, type: "blocks" });
+      } else if (gate === "monitor") {
+        await db.update(issues).set({ monitorNextCheckAt: new Date("2099-01-01"), monitorNotes: "Wait for external result" }).where(eq(issues.id, sourceIssueId));
+      } else if (gate === "budget") {
+        await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: coderId, metric: "billed_cents",
+          windowKind: "calendar_month_utc", amount: 1, hardStopEnabled: true, isActive: true });
+        await db.insert(costEvents).values({ companyId, agentId: coderId, issueId: sourceIssueId, provider: "test",
+          biller: "test", billingType: "tokens", model: "test-model", costCents: 1, occurredAt: new Date() });
+      } else if (gate === "active_run") {
+        await seedHeartbeatRun({ companyId, agentId: coderId, runId: randomUUID(), issueId: sourceIssueId, status: "running" });
+      } else if (gate === "reassigned") {
+        await db.update(issues).set({ assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+      } else if (gate === "native") {
+        await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: sourceIssueId }).where(eq(heartbeatRuns.id, runId));
+      } else {
+        await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, sourceIssueId));
+      }
+      const before = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      const runsBefore = await db.select().from(heartbeatRuns);
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      expect(await recovery.reconcileLegacyContinuation(runId)).toBe("skipped");
+      // These successful legacy cases also enter through the production sweep.
+      if (!["active_run", "native", "review"].includes(gate)) {
+        expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ escalated: 0 });
+      }
+      expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(before);
+      expect(await db.select().from(heartbeatRuns)).toEqual(runsBefore);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      expect(await db.select().from(issueComments)).toHaveLength(0);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
 
   async function seedNativeFinalizationRecovery(status: string) {
     const fixture = await seedCompany();
