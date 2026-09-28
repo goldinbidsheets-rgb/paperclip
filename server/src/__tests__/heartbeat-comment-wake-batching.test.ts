@@ -68,7 +68,7 @@ async function closeDbClient(db: ReturnType<typeof createDb> | undefined) {
   await db?.$client?.end?.({ timeout: 0 });
 }
 
-async function createControlledGatewayServer() {
+async function createControlledGatewayServer(beforeComplete?: (turn: number) => Promise<void>) {
   const server = createServer();
   const wss = new WebSocketServer({ server });
   const agentPayloads: Array<Record<string, unknown>> = [];
@@ -151,6 +151,7 @@ async function createControlledGatewayServer() {
         if (waitCount === 1) {
           await firstWaitGate;
         }
+        await beforeComplete?.(waitCount);
         socket.send(
           JSON.stringify({
             type: "res",
@@ -697,7 +698,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
   }, 120_000);
 
   it("cancels an empty deferred comment wake instead of promoting deleted input", async () => {
-    const gateway = await createControlledGatewayServer();
+    const gateway = await createControlledGatewayServer(async turn => {
+      if (turn === 1) await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    });
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -1198,7 +1201,12 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
-  it("does not reopen a finished issue when the deferred comment wake came from another agent", async () => {
+  it.each([
+    { caseName: "allows a non-assignee mention on completed work", targetAssignee: false, terminalStatus: "done", explicitResume: false },
+    { caseName: "delivers explicit agent feedback after completion", targetAssignee: true, terminalStatus: "done", explicitResume: true },
+    { caseName: "cancels an assignee continuation without resume intent on completed work", targetAssignee: true, terminalStatus: "done", explicitResume: false },
+    { caseName: "cancels an assignee continuation on cancelled work", targetAssignee: true, terminalStatus: "cancelled", explicitResume: true },
+  ] as const)("$caseName", async ({ targetAssignee, terminalStatus, explicitResume }) => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -1206,6 +1214,10 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     const issueId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const heartbeat = heartbeatService(db);
+    const targetAgentId = targetAssignee ? assigneeAgentId : mentionedAgentId;
+    const shouldReopen = targetAssignee && terminalStatus === "done" && explicitResume;
+    const commentingAgentId = targetAssignee ? mentionedAgentId : assigneeAgentId;
+    const wakeReason = targetAssignee ? "issue_commented" : "issue_comment_mentioned";
 
     try {
       await db.insert(companies).values({
@@ -1262,7 +1274,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       await db.insert(issues).values({
         id: issueId,
         companyId,
-        title: "Do not reopen from agent mention",
+        title: "Agent feedback at completion boundary",
         status: "todo",
         priority: "medium",
         responsibleUserId: "responsible-user",
@@ -1301,28 +1313,29 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         .values({
           companyId,
           issueId,
-          authorAgentId: assigneeAgentId,
-          createdByRunId: firstRun?.id ?? null,
+          authorAgentId: commentingAgentId,
+          createdByRunId: targetAssignee ? null : firstRun?.id ?? null,
           body: "@Mentioned Agent please review after I finish",
         })
         .returning()
         .then((rows) => rows[0]);
 
-      const deferredRun = await heartbeat.wakeup(mentionedAgentId, {
+      const deferredRun = await heartbeat.wakeup(targetAgentId, {
         source: "automation",
         triggerDetail: "system",
-        reason: "issue_comment_mentioned",
+        reason: wakeReason,
         payload: { issueId, commentId: comment.id },
         contextSnapshot: {
           issueId,
           taskId: issueId,
           commentId: comment.id,
           wakeCommentId: comment.id,
-          wakeReason: "issue_comment_mentioned",
+          wakeReason,
+          ...(explicitResume ? { resumeIntent: true, followUpRequested: true } : {}),
           source: "comment.mention",
         },
         requestedByActorType: "agent",
-        requestedByActorId: assigneeAgentId,
+        requestedByActorId: commentingAgentId,
       });
 
       expect(deferredRun).toBeNull();
@@ -1334,7 +1347,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           .where(
             and(
               eq(agentWakeupRequests.companyId, companyId),
-              eq(agentWakeupRequests.agentId, mentionedAgentId),
+              eq(agentWakeupRequests.agentId, targetAgentId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
             ),
           )
@@ -1349,7 +1362,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       await db
         .update(issues)
         .set({
-          status: "done",
+          status: terminalStatus,
           completedAt: new Date(),
           executionRunId: null,
           executionAgentNameKey: null,
@@ -1359,6 +1372,26 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         .where(eq(issues.id, issueId));
 
       gateway.releaseFirstWait();
+
+      if (targetAssignee && !shouldReopen) {
+        await waitFor(async () => {
+          const cancelled = await db.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, targetAgentId),
+            eq(agentWakeupRequests.status, "cancelled"),
+          ));
+          return cancelled.some((wake) => wake.error === "Deferred execution wake no longer applies to a terminal task");
+        });
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        expect(runs).toEqual([expect.objectContaining({ id: firstRun!.id, status: "succeeded" })]);
+        expect(gateway.getAgentPayloads()).toHaveLength(1);
+        const [closedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(closedIssue).toMatchObject({ status: terminalStatus, executionRunId: null });
+        expect(closedIssue.completedAt).not.toBeNull();
+        const [retainedComment] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
+        expect(retainedComment.body).toContain("please review after I finish");
+        return;
+      }
 
       await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
       await waitFor(async () => {
@@ -1371,32 +1404,42 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         );
       }, 90_000);
 
+      const continuation = (await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, targetAgentId),
+      ))).find((run) => run.id !== firstRun!.id);
+      expect(continuation).toMatchObject({
+        agentId: targetAgentId,
+        contextSnapshot: expect.objectContaining({ issueId }),
+      });
       const issueAfterPromotion = await db
         .select({
           status: issues.status,
           completedAt: issues.completedAt,
+          assigneeAgentId: issues.assigneeAgentId,
         })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
 
       expect(issueAfterPromotion).toMatchObject({
-        status: "done",
+        status: shouldReopen ? "in_progress" : "done",
+        assigneeAgentId,
       });
-      expect(issueAfterPromotion?.completedAt).not.toBeNull();
+      if (shouldReopen) expect(issueAfterPromotion?.completedAt).toBeNull();
+      else expect(issueAfterPromotion?.completedAt).not.toBeNull();
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
       expect(secondPayload.paperclip).toBeUndefined();
       const secondWake = parseWakePayloadFromMessage(secondPayload.message);
       expect(secondWake).toMatchObject({
-        reason: "issue_comment_mentioned",
+        reason: wakeReason,
         commentIds: [comment.id],
         latestCommentId: comment.id,
         issue: {
           id: issueId,
           identifier: `${issuePrefix}-1`,
-          title: "Do not reopen from agent mention",
-          status: "done",
+          title: "Agent feedback at completion boundary",
+          status: shouldReopen ? "in_progress" : "done",
           priority: "medium",
         },
       });
@@ -1604,7 +1647,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
   }, 120_000);
 
   it("promotes an interaction continuation with its full authoritative source comment after removing a coalesced self-comment", async () => {
-    const gateway = await createControlledGatewayServer();
+    const gateway = await createControlledGatewayServer(async turn => {
+      if (turn === 2) await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    });
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -1928,6 +1973,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           externalLabel: "Slack direct message",
           sessionGeneration: 1,
           isDirectMessage: true,
+          communicationGuidance: "## Communication in Slack\nFrozen connection preference.",
           state: "active",
         });
         await db.insert(chatExternalPrincipals).values({
@@ -1990,6 +2036,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
             issueId,
             taskId: issueId,
             source: "chat:slack",
+            paperclipTaskCommunicationGuidance: "FORGED caller preference",
             commentId: sourceComment.id,
             wakeCommentId: sourceComment.id,
             wakeCommentIds: [sourceComment.id],
@@ -2220,6 +2267,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
             wakeCommentId: sourceComment.id,
             wakeCommentIds: [sourceComment.id],
             paperclipExternalChatExecutionBound: true,
+            paperclipTaskCommunicationGuidance: "## Communication in Slack\nFrozen connection preference.",
             paperclipExternalChatQuestionResponse: expect.objectContaining({
               schema: "paperclip.external_chat_question_response.v1",
               interactionId: answered.id,
@@ -2233,6 +2281,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
           "preserve this full source instruction",
         );
+        const restoredPrompt = String(gateway.getAgentPayloads()[0]?.message ?? "");
+        expect(restoredPrompt.match(/Frozen connection preference\./g)).toHaveLength(1);
+        expect(restoredPrompt).not.toContain("FORGED caller preference");
         expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
           "Preserve the original request's exact-output constraints literally.",
         );
@@ -2889,7 +2940,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
   }, 120_000);
 
   it("promotes an interaction continuation after removing a coalesced self-authored comment", async () => {
-    const gateway = await createControlledGatewayServer();
+    const gateway = await createControlledGatewayServer(async turn => {
+      if (turn === 2) await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    });
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -3576,7 +3629,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
   }, 120_000);
   it("treats the automatic run summary as fallback-only when the run already posted a comment", async () => {
-    const gateway = await createControlledGatewayServer();
+    const gateway = await createControlledGatewayServer(async turn => {
+      if (turn === 2) await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    });
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -3674,30 +3729,10 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       expect(sourceRun?.issueCommentStatus).toBe("satisfied");
       expect(sourceRun?.issueCommentSatisfiedByCommentId).not.toBeNull();
 
-      await waitFor(async () => {
-        const comments = await db
-          .select()
-          .from(issueComments)
-          .where(eq(issueComments.issueId, issueId));
-        const wakeups = await db
-          .select()
-          .from(agentWakeupRequests)
-          .where(
-            and(
-              eq(agentWakeupRequests.companyId, companyId),
-              eq(agentWakeupRequests.agentId, agentId),
-            ),
-          );
-
-        const hasHandoffComment = comments.some(
-          (comment) =>
-            comment.body === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
-        );
-        const hasHandoffWake = wakeups.some(
-          (wakeup) => wakeup.reason === "finish_successful_run_handoff",
-        );
-        return hasHandoffComment && hasHandoffWake;
-      });
+      await waitFor(async () => (await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId)))
+        .some(wake => wake.reason === "issue_disposition_repair"));
+      await heartbeat.drainActiveRunExecutions();
 
       const comments = await db
         .select()
@@ -3711,12 +3746,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
             comment.body === "Manual completion comment from the run.",
         ),
       ).toBe(true);
-      expect(
-        comments.some(
-          (comment) =>
-            comment.body === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
-        ),
-      ).toBe(true);
+      expect(comments.some(comment => comment.body === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY)).toBe(false);
       expect(
         comments.every((comment) => !comment.body.startsWith("## Run summary")),
       ).toBe(true);
@@ -3736,7 +3766,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       ).toBe(false);
       expect(
         wakeups.some(
-          (wakeup) => wakeup.reason === "finish_successful_run_handoff",
+          (wakeup) => wakeup.reason === "issue_disposition_repair",
         ),
       ).toBe(true);
     } finally {

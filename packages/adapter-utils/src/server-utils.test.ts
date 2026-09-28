@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
+  readPaperclipRuntimeSkillEntries,
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildPersistentSkillSnapshot,
@@ -14,6 +15,7 @@ import {
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   isPaperclipExternalChatContractTurn,
   isPaperclipExternalChatQuestionResponseTurn,
   isPaperclipExternalChatTurn,
@@ -24,6 +26,7 @@ import {
   resolveLegacyPaperclipDesiredSkillNames,
   resolvePaperclipDesiredSkillNames,
   selectPaperclipTaskMarkdown,
+  selectInitialCommunicationGuidance,
   runningProcesses,
   runChildProcess,
   sanitizeSshRemoteEnv,
@@ -85,6 +88,9 @@ describe("runtime connection tool delivery", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
       CONNECTION_INTENT_AGENT_GUIDANCE,
     );
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(CONNECTION_INTENT_AGENT_GUIDANCE);
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).not.toContain("Execution contract:");
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).not.toContain("child issues");
   });
 });
 
@@ -907,6 +913,30 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it("leaves conversation disposition and accepted-plan handoff to the injected chat policy", () => {
+    const payload = {
+      reason: "issue_commented",
+      issue: { id: "chat", workMode: "planning", status: "in_progress" },
+      interactionKind: "request_confirmation",
+      interactionStatus: "accepted",
+      comments: [],
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      fallbackFetchNeeded: false,
+    };
+    const ordinary = renderPaperclipWakePrompt(payload, { resumedSession: true });
+    expect(ordinary).toContain("Execution contract:");
+    expect(ordinary).toContain("Create child issues from the approved plan");
+    for (const resumedSession of [false, true]) {
+      const chat = renderPaperclipWakePrompt(payload, {
+        resumedSession, conversationMode: true, includeExecutionContract: true,
+      });
+      expect(chat).not.toContain("Execution contract:");
+      expect(chat).not.toContain("clear final disposition");
+      expect(chat).not.toContain("Create child issues");
+      expect(chat).not.toContain("you may create child implementation issues");
+    }
+  });
+
   const ordinaryExternalChatWake = {
     reason: "External chat message received",
     externalChatProvider: " GitHub ",
@@ -2853,6 +2883,17 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it("delivers typed disposition repair instructions without liveness classification", () => {
+    const payload = { reason: "issue_disposition_repair", issue: { id: "issue-1", status: "in_progress" },
+      dispositionRepair: { attempt: 1, maxAttempts: 2, sourceRunId: "source-1", instruction: "Record completion or a durable waiting path through the API." } };
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("Task disposition repair:");
+    expect(prompt).toContain("- attempt: 1/2");
+    expect(prompt).toContain(payload.dispositionRepair.instruction);
+    expect(prompt).not.toContain("liveness state:");
+    expect(JSON.parse(stringifyPaperclipWakePayload(payload)!)).toMatchObject({ dispositionRepair: payload.dispositionRepair });
+  });
+
   it("includes continuation and child issue summaries in structured wake context", () => {
     const payload = {
       reason: "issue_children_completed",
@@ -3022,6 +3063,24 @@ describe("selectPaperclipTaskMarkdown", () => {
         { resumedSession: true },
       ),
     ).toBe(compactMarkdown);
+  });
+
+  it("adds saved communication guidance only to a fresh session, including after recovery", () => {
+    const context = {
+      paperclipTaskMarkdown: fullMarkdown,
+      paperclipTaskMarkdownCompact: compactMarkdown,
+      paperclipTaskCommunicationGuidance: "## Communication in Slack\nSaved initial guidance",
+      paperclipWake: wake("issue_commented"),
+    };
+    expect(selectPaperclipTaskMarkdown(context)).toContain("Saved initial guidance");
+    expect(selectInitialCommunicationGuidance({ paperclipTaskCommunicationGuidance: "  Slack preference  " })).toBe("Slack preference");
+    expect(selectInitialCommunicationGuidance(context, { resumedSession: true })).toBe("");
+    expect(selectInitialCommunicationGuidance({})).toBe("");
+    expect(selectPaperclipTaskMarkdown(context, { resumedSession: true })).toBe(compactMarkdown);
+    expect(selectPaperclipTaskMarkdown(context, { includeCommunicationGuidance: false })).toBe(fullMarkdown);
+    context.paperclipWake = { ...wake("issue_monitor_recovery"), recovery: { cause: "process_lost" } } as typeof context.paperclipWake;
+    expect(selectPaperclipTaskMarkdown(context, { resumedSession: true })).toBe(fullMarkdown);
+    expect(selectPaperclipTaskMarkdown(context, { resumedSession: false }).match(/Saved initial guidance/g)).toHaveLength(1);
   });
 
   it("falls back to the full markdown when no compact variant exists", () => {
@@ -3377,6 +3436,13 @@ describe("applyPaperclipWorkspaceEnv", () => {
 });
 
 describe("shapePaperclipWorkspaceEnvForExecution", () => {
+  it("maps editable project repositories inside the remote workspace", () => {
+    const result = shapePaperclipWorkspaceEnvForExecution({
+      workspaceCwd: "/host/task", executionCwd: "/sandbox/task", executionTargetIsRemote: true,
+      workspaceHints: [{ workspaceId: "backend", cwd: "/host/task/.paperclip-repositories/backend" }],
+    });
+    expect(result.workspaceHints).toEqual([{ workspaceId: "backend", cwd: "/sandbox/task/.paperclip-repositories/backend" }]);
+  });
   it("rewrites workspace env paths for remote execution", () => {
     const shaped = shapePaperclipWorkspaceEnvForExecution({
       workspaceCwd: "/tmp/workspace",
@@ -3662,6 +3728,16 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     expect(env.PAPERCLIP_CLOUD_PROVIDER_TOKEN).toBe("cloud-token");
   });
 
+  it("does not restore the retired wake JSON variable from config", () => {
+    const env: Record<string, string> = {};
+    refreshPaperclipWorkspaceEnvForExecution({
+      env,
+      envConfig: { PAPERCLIP_WAKE_PAYLOAD_JSON: "stale wake" },
+      workspaceCwd: null,
+    });
+    expect(env).not.toHaveProperty("PAPERCLIP_WAKE_PAYLOAD_JSON");
+  });
+
   it("never accepts PAPERCLIP_API_KEY from config env", () => {
     const env: Record<string, string> = {};
 
@@ -3751,5 +3827,21 @@ describe("buildPaperclipEnv", () => {
         expect(env.PAPERCLIP_API_URL).toBe("http://localhost:3200");
       },
     );
+  });
+});
+
+
+describe("runtime skill assignment boundaries", () => {
+  it("preserves an explicitly empty assignment instead of discovering bundled connector skills", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-empty-"));
+    try {
+      await fs.mkdir(path.join(root, "agentmail"));
+      await fs.writeFile(path.join(root, "agentmail", "SKILL.md"), "---\nname: agentmail\ndescription: Email connector\n---\n");
+      const discovered = await readPaperclipRuntimeSkillEntries({}, root, [root]);
+      expect(discovered.some((entry) => entry.runtimeName === "agentmail")).toBe(true);
+      expect(await readPaperclipRuntimeSkillEntries({ paperclipRuntimeSkills: [] }, root, [root])).toEqual([]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });

@@ -5,6 +5,8 @@ export const CHAT_PROVIDERS = [
   "discord",
   "microsoft-teams",
   "telegram",
+  "agentmail",
+  "imessage-photon",
 ] as const;
 export type ChatProvider = (typeof CHAT_PROVIDERS)[number];
 
@@ -179,15 +181,31 @@ export interface ChatEndpointCallbackSurfaces {
   slashCommands: ChatEndpointCallbackSurfaceState;
 }
 
+export interface SlackAppConfiguration {
+  appName: string;
+  botName: string;
+  command: string;
+}
+
 export interface ChatEndpointSetupState {
+  github?: {
+    stage: "connect" | "install" | "repositories" | "verify" | "identity" | "behavior" | "test";
+    appSlug?: string;
+    installationUrl?: string;
+    managementUrl?: string;
+    registrationStatus?: "pending" | "completed" | "failed";
+  };
   step: "choose_agent" | "provider_setup" | "test" | "complete";
   /** Server-generated boundary; only provider events at or after this time can complete setup. */
   testStartedAt?: string | null;
+  /** Onboarding was finished without requiring a full conversation test. */
+  testSkipped?: boolean;
   /** Set only after the provider has delivered a signed callback challenge. */
   webhookVerifiedAt?: string | null;
   authorizationUrl?: string | null;
   providerUrl?: string | null;
   command?: string | null;
+  slackApp?: SlackAppConfiguration;
   webhookUrl?: string | null;
   messagingEndpoint?: string | null;
   /** Safe presence signal only; the secret value is returned once by its generation endpoint. */
@@ -202,10 +220,18 @@ export interface ChatEndpointSetupSecret {
   webhookSecret: string;
 }
 
+export type ChannelPublicationMode = "automatic" | "explicit";
+export type ExternalMessageExecutionPolicy = "restricted" | "agent";
+
 export interface ChatEndpoint {
+  /** Additional presentation instructions captured only for newly created tasks. */
+  communicationInstructions?: string;
   id: string;
   companyId: string;
   connectionId: string;
+  /** Older clients omit these fields; defaults are automatic/restricted. */
+  publicationMode?: ChannelPublicationMode;
+  externalExecutionPolicy?: ExternalMessageExecutionPolicy;
   provider: ChatProvider;
   publicId: string;
   status: ChatEndpointStatus;
@@ -219,6 +245,7 @@ export interface ChatEndpoint {
   botUsername?: string | null;
   botLabel?: string | null;
   botAvatarUrl?: string | null;
+  photonAllocation?: "dedicated" | "shared";
   allowDirectMessages: boolean;
   allowGroupChats: boolean;
   allowUnlinkedPeople: boolean;
@@ -248,6 +275,7 @@ export interface ChatEndpointResource {
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
+  participants?: string[];
 }
 
 export interface ChatExternalPrincipal {
@@ -269,6 +297,8 @@ export interface ChatIdentityLink {
   companyId: string;
   endpointId: string;
   principalId: string;
+  /** Latest discovery-only connect command received by this endpoint. */
+  lastConnectAt?: string | null;
   externalLabel: string;
   externalDetail?: string | null;
   paperclipUserId?: string | null;
@@ -452,6 +482,8 @@ export interface CreateChatEndpointInput {
 }
 
 export interface UpdateChatEndpointInput {
+  slackApp?: SlackAppConfiguration;
+  communicationInstructions?: string;
   allowDirectMessages?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople?: boolean;
@@ -460,6 +492,7 @@ export interface UpdateChatEndpointInput {
 export interface ConfigureChatEndpointInput {
   action: "configure" | "verify" | "pause" | "resume" | "reconnect" | "remove";
   credentials?: Record<string, string>;
+  photon?: PhotonChannelConfiguration;
 }
 
 export interface NormalizedChatEvent {
@@ -496,3 +529,15 @@ export interface NormalizedChatEvent {
   };
   raw: Record<string, unknown>;
 }
+
+/** Safe Photon project inspection; credentials and line tokens are never serialized. */
+export interface PhotonProjectInspection {
+  projectId: string;
+  projectName: string;
+  allocation: "dedicated" | "shared";
+  eligible: boolean;
+  lines: Array<{ lineId: string; phoneNumber: string; eligible: boolean; unavailableReason?: string }>;
+}
+export type PhotonChannelConfiguration =
+  | { allocation?: "dedicated"; projectId: string; lineId: string }
+  | { allocation: "shared"; projectId: string };

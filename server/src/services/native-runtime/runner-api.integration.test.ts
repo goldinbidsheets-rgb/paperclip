@@ -4,7 +4,7 @@ import { chmod, writeFile, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { documents, heartbeatRuns, issues, routineDocuments, routines } from "@paperclipai/db";
-import { beforeAll, afterAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, afterAll, beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { startRunnerApiTestServer } from "../../__tests__/helpers/runner-api-server.js";
 import { createRunnerdCodexTransport, defaultCapabilityRunnerdBinary } from "../../vendor/paperclip-runner/index.js";
 import { runnerApiCatalog } from "./runner-api-catalog.js";
@@ -13,32 +13,42 @@ import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 describe("runner API against real HTTP routes", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
   const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
-  const oldEnabled = process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_RUNNER_API_TOOLS_ENABLED", undefined);
+    vi.stubEnv("PAPERCLIP_RUNNER_API_TOOLS_COMPANY_IDS", undefined);
+  });
+  afterEach(() => vi.unstubAllEnvs());
   beforeAll(async () => {
     process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID();
-    process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = "true";
     server = await startRunnerApiTestServer();
   }, 60_000);
   afterAll(async () => {
     await server?.close();
     if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
-    if (oldEnabled === undefined) delete process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
-    else process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = oldEnabled;
   });
 
-  it.skipIf(!process.env.PAPERCLIP_REQUIRE_RUNNER_API_INTEGRATION && !existsSync(defaultCapabilityRunnerdBinary()))("runs runnerd → PRP → authority → actual authenticated HTTP", async () => {
+  it.skipIf(!process.env.PAPERCLIP_REQUIRE_RUNNER_API_INTEGRATION && !existsSync(defaultCapabilityRunnerdBinary())).each(["current", "legacy_http"])("runs runnerd → PRP → authority → actual authenticated HTTP (%s receipt)", async (receiptFormat) => {
     const fixture = await server.fixture();
-    const provider = join(server.root, "scripted-api-provider.mjs");
+    const provider = join(server.root, `scripted-api-provider-${receiptFormat}.mjs`);
     await writeFile(provider, `#!${process.execPath}
 import { createInterface } from 'node:readline';
 const send = value => process.stdout.write(JSON.stringify(value)+'\\n');
 let step = 0;
-const calls = [{tool:'search_api',arguments:{query:'list projects'}},{tool:'call_api',arguments:{operationId:'GET /api/companies/{companyId}/projects'}}];
+const calls = [{tool:'search_api',arguments:{query:'list projects'}},{tool:'call_api',arguments:{operationId:'GET /api/companies/{companyId}/projects'}},{tool:'call_api',arguments:{operationId:'GET /api/projects/{id}',pathParams:{id:'${fixture.foreignProjectId}'}}}];
 const next = () => { const c=calls[step++]; if(c) send({id:'call-'+step,method:'item/tool/call',params:{threadId:'api-thread',turnId:'api-turn',itemId:'api-item-'+step,callId:'api-call-'+step,...c}}); else send({method:'turn/completed',params:{turn:{id:'api-turn',status:'completed'}}}); };
 for await (const line of createInterface({input:process.stdin})) {
 const m=JSON.parse(line);
-if(!m.method) {if(String(m.id).startsWith('call-')) next(); continue;}
+if(!m.method) {if(String(m.id).startsWith('call-')) {
+  if(step > 1) {
+    const envelope=JSON.parse(m.result.contentItems[0].text);
+    if(envelope.operationId!=='call_api'||envelope.callId!=='api-call-'+step) throw new Error('API receipt lost semantic call identity');
+    const receipt=envelope.result;
+    if(step===2 && (receipt.status!==200||receipt.data[0].name!=='Aurora')) throw new Error('Provider did not receive successful HTTP result');
+    if(step===3 && (receipt.status!==404||receipt.ok!==false)) throw new Error('Provider did not receive HTTP denial');
+  }
+  next();
+} continue;}
 if(m.method==='initialize') send({id:m.id,result:{userAgent:'scripted-api-provider'}});
 else if(m.method==='thread/start') send({id:m.id,result:{thread:{id:'api-thread',sessionId:'api-session'}}});
 else if(m.method==='turn/start') {send({id:m.id,result:{turn:{id:'api-turn',status:'inProgress'}}});send({method:'turn/started',params:{turn:{id:'api-turn'}}});next();}
@@ -48,7 +58,7 @@ else if(m.id!==undefined) send({id:m.id,result:{}});
     await chmod(provider, 0o700);
     const bundle = createRunnerdCodexTransport({
       runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: provider, codexArgs: [],
-      stateDirectory: join(server.root, "scripted-runner"), lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+      stateDirectory: join(server.root, `scripted-runner-${receiptFormat}`), lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
       prpIdentity: { runnerInstanceId: "api-test", environmentLeaseId: "api-test-lease", runId: fixture.runId, normalizedSessionId: "api-test-session", turnId: "api-test-turn", itemId: "api-test-item" },
       controlPlaneRegistration: prp => registerRunnerPrpAuthority({ companyId: fixture.companyId, runId: fixture.runId, authority: prp }),
     });
@@ -57,29 +67,42 @@ else if(m.id!==undefined) send({id:m.id,result:{}});
       const params = request.params as any;
       const result = await fixture.authority.execute({ tool: params.tool, arguments: params.arguments, callId: params.callId });
       results.push(result);
-      return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ ok: true, result }) }] };
+      // Match production's dynamicToolResponse: an extra test-only envelope
+      // hides collisions between API response fields and PRP tool identity.
+      const { apiOperationId, ...receipt } = result as Record<string, unknown>;
+      const wireResult = receiptFormat === "legacy_http" && params.tool === "call_api"
+        ? { ...receipt, operationId: apiOperationId }
+        : result;
+      return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(wireResult) }] };
     });
     try {
       await bundle.transport.request("initialize", {});
       await bundle.transport.request("thread/start", { cwd: fixture.workspace, dynamicTools: await fixture.authority.definitions() });
       await bundle.transport.request("turn/start", { input: [{ type: "text", text: "Find the project" }] });
-      for await (const notification of bundle.transport.notifications()) if (notification.method === "turn/completed") break;
-      expect(results).toHaveLength(2);
-      expect(results[1]).toMatchObject({ status: 200, data: [{ id: fixture.projectId, name: "Aurora" }] });
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          (async () => { for await (const notification of bundle.transport.notifications()) if (notification.method === "turn/completed") return; })(),
+          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Native provider did not continue after the API tool result")), 10_000); }),
+        ]);
+      } finally { clearTimeout(timeout); }
+      expect(results).toHaveLength(3);
+      expect(results[1]).toMatchObject({ status: 200, apiOperationId: "GET /api/companies/{companyId}/projects", data: [{ id: fixture.projectId, name: "Aurora" }] });
+      expect(results[2]).toMatchObject({ ok: false, status: 404 });
       expect(bundle.evidence().diagnostics).toContain("runnerd authenticated to the durable PRP control plane");
     } finally { await bundle.transport.close(); }
   }, 30_000);
 
-  it("cannot opt into API tools through a binding when the operator flag is absent", async () => {
+  it("cannot opt into API tools through a binding when the operator flag is false", async () => {
     const fixture = await server.fixture({ apiToolsEnabled: true });
-    delete process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
+    process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = "false";
     try {
       const names = (await fixture.authority.definitions()).map(tool => tool.name);
       expect(names).toContain("get_task_context");
       expect(names).not.toContain("search_api");
       expect(names).not.toContain("call_api");
       await expect(fixture.authority.execute({ tool: "call_api", callId: "disabled", arguments: { operationId: "GET /api/companies/{companyId}/projects" } })).rejects.toThrow("not_advertised");
-    } finally { process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = "true"; }
+    } finally { delete process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED; }
   });
 
   it("rejects credential calls before any durable receipt or secret result exists", async () => {
@@ -264,6 +287,8 @@ else if(m.id!==undefined) send({id:m.id,result:{}});
     expect(treatment.issueId).toBe(baseline.issueId);
     expect((await treatment.snapshot()).issues[0].billingCode).toBeNull();
     const originalTools = (await baseline.authority.definitions()).map(tool => tool.name);
-    expect((await treatment.authority.definitions()).filter(tool => !["call_api", "search_api"].includes(String(tool.name))).map(tool => tool.name)).toEqual(originalTools);
+    const treatmentTools = (await treatment.authority.definitions()).map(tool => tool.name);
+    expect(treatmentTools.filter(name => !originalTools.includes(name))).toEqual(["hire_agent", "search_api", "call_api"]);
+    expect(treatmentTools.filter(name => !["hire_agent", "search_api", "call_api"].includes(String(name)))).toEqual(originalTools);
   });
 });
