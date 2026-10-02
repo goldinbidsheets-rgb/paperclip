@@ -1,0 +1,107 @@
+name: Warm attach observer comparison
+permissions:
+  contents: read
+concurrency:
+  group: warm-attach-observer-comparison
+  cancel-in-progress: false
+jobs:
+  compare:
+    if: github.repository == 'goldinbidsheets-rgb/paperclip' && github.event.repository.fork == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        source:
+        - upstream
+        - merged
+        variant:
+        - baseline
+        - candidate
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        path: diagnostic
+        persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: paperclipai/paperclip
+        ref: ${{ matrix.source == 'upstream' && 'e00d10d5d5594f6e2d1e8cf4e0ec81c074b0bd88' || 'd93b72fd9d86b4b416c6865534ff5c4a7b28784c' }}
+        path: target
+        persist-credentials: false
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: 24.21.0
+    - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+      with:
+        version: 9.15.4
+        run_install: false
+    - name: Capture source and frozen dependency pins
+      working-directory: target
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p ../receipts
+        git show -s --format='%H%n%T%n%P' HEAD | tee ../receipts/source.txt
+        if [ '${{ matrix.source }}' = merged ]; then
+          test "$(git rev-parse 'HEAD^{tree}')" = 3d2dfa11f3528a4a9364d19a23e1a290f3f78216
+        fi
+        sha256sum pnpm-lock.yaml packages/paperclip-runner/runner/Cargo.lock > ../receipts/dependency-hashes.txt
+        cp pnpm-lock.yaml ../receipts/pnpm-lock.yaml
+        cp packages/paperclip-runner/runner/Cargo.lock ../receipts/Cargo.lock
+        node --version > ../receipts/node-version.txt
+        pnpm --version > ../receipts/pnpm-version.txt
+        uname -a > ../receipts/platform.txt
+        pnpm install --frozen-lockfile 2>&1 | tee ../receipts/install.log
+        pnpm list --depth 0 --json > ../receipts/dependencies.json
+        git diff --exit-code -- pnpm-lock.yaml
+    - name: Prepare bounded test-only diagnostics
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ '${{ matrix.variant }}' = candidate ]; then
+          git -C target apply --check ../diagnostic/diagnostics/warm-attach/warm-observer-candidate.patch
+          git -C target apply ../diagnostic/diagnostics/warm-attach/warm-observer-candidate.patch
+        fi
+        python3 diagnostic/diagnostics/warm-attach/prepare-diagnostic.py target '${{ matrix.variant }}'
+        git -C target diff > receipts/diagnostic.patch
+    - name: Prepare runner dependencies
+      working-directory: target/packages/paperclip-runner
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup toolchain install 1.97.1 --profile minimal
+        rustc --version > ../../../receipts/rust-version.txt
+        cc --version > ../../../receipts/cc-version.txt
+        pnpm run ensure:eval-build-deps 2>&1 | tee ../../../receipts/eval-build.log
+        pnpm run build:rust 2>&1 | tee ../../../receipts/rust-build.log
+    - name: Focused native and controller cases
+      working-directory: target/packages/paperclip-runner
+      shell: bash
+      env:
+        DIAGNOSTIC_OUTPUT: ${{ github.workspace }}/receipts/native-natural
+      run: |
+        set +e
+        pnpm exec vitest run src/live/runnerd-codex-transport.test.ts -t '^preserves old warm-attach authority and event ownership across ' --reporter=verbose --reporter=json --outputFile.json=../../../receipts/native-natural.json 2>&1 | tee ../../../receipts/native-natural.log
+        natural=${PIPESTATUS[0]}
+        printf '%s\n' "$natural" > ../../../receipts/native-natural-exit.txt
+        DIAGNOSTIC_OUTPUT="${GITHUB_WORKSPACE}/receipts/native-forced" WARM_OBSERVER_ORDER=after-activation pnpm exec vitest run src/live/runnerd-codex-transport.test.ts -t '^preserves old warm-attach authority and event ownership across lost-ack$' --reporter=verbose --reporter=json --outputFile.json=../../../receipts/native-forced.json 2>&1 | tee ../../../receipts/native-forced.log
+        forced=${PIPESTATUS[0]}
+        printf '%s\n' "$forced" > ../../../receipts/native-forced-exit.txt
+        pnpm exec vitest run src/control-plane/durable-prp-control-plane.test.ts -t 'captures old warm authority when the observer runs' --reporter=verbose --reporter=json --outputFile.json=../../../receipts/controller.json 2>&1 | tee ../../../receipts/controller.log
+        controller=${PIPESTATUS[0]}
+        printf '%s\n' "$controller" > ../../../receipts/controller-exit.txt
+        test -s ../../../receipts/native-natural/lost-ack.json || exit 2
+        test -s ../../../receipts/native-forced/lost-ack.json || exit 2
+        test "$natural" = 0 && test "$forced" = 0 && test "$controller" = 0
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: warm-attach-${{ matrix.source }}-${{ matrix.variant }}
+        path: receipts/
+        retention-days: 7
+        if-no-files-found: error
+'on':
+  workflow_dispatch: null

@@ -23,7 +23,8 @@ export async function captureSignoff(companyId: string, issueIds: string[]) {
   const pid = await readFile(path.join(dataDir, "postmaster.pid"), "utf8");
   const port = Number(pid.split("\n")[3]);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Invalid fixture database port");
-  const db = createDb(`postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`);
+  const databaseUrl = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+  const db = createDb(databaseUrl);
   try {
     const runRows = await db.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId,
       status: heartbeatRuns.status, wakeupRequestId: heartbeatRuns.wakeupRequestId,
@@ -45,5 +46,5 @@ export async function captureSignoff(companyId: string, issueIds: string[]) {
     }).from(issues).where(eq(issues.companyId, companyId))).filter((row) => issueIds.includes(row.id));
     await writeFile(path.join(directory, "signoff-database.json"), JSON.stringify({ capturedAt: new Date().toISOString(),
       companyId, issueIds, states, runs, wakes, limitReached: runRows.length === 500 || wakeRows.length === 500 }, null, 2));
-  } finally { await closeRegisteredClients(); }
+  } finally { await closeRegisteredClients(databaseUrl); }
 }
