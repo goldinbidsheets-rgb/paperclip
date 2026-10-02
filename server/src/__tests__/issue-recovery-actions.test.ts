@@ -304,6 +304,58 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     },
   );
 
+  it.each(["terminated", "paused", "pending_approval", "wake_disabled"])(
+    "supersedes an existing repair action when its owner becomes unavailable (%s)",
+    async (unavailable) => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "succeeded" });
+      const prior = await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId, sourceIssueId, kind: "deliberate_wait_without_target",
+        ownerType: "agent", ownerAgentId: coderId,
+        previousOwnerAgentId: coderId, returnOwnerAgentId: coderId,
+        cause: "deliberate_wait_without_target", fingerprint: "prior-repair-episode",
+        evidence: { sourceRunId: runId, repairAudit: "preserve this history" },
+        nextAction: "Repair the source disposition.", attemptCount: 1, maxAttempts: 5,
+        wakePolicy: { type: "bounded_owner_disposition_repair", ownerAgentId: coderId },
+      });
+      await db.update(agents).set(unavailable === "wake_disabled"
+        ? { runtimeConfig: { heartbeat: { wakeOnDemand: false } } }
+        : { status: unavailable }).where(eq(agents.id, coderId));
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      expect(await recovery.reconcileLegacyContinuation(runId)).toBe("escalated");
+      const actions = await db.select().from(issueRecoveryActions);
+      expect(actions).toHaveLength(2);
+      expect(actions.find((action) => action.id === prior.id)).toMatchObject({
+        status: "cancelled", outcome: "cancelled", ownerType: "agent", ownerAgentId: coderId,
+        fingerprint: prior.fingerprint, evidence: prior.evidence, attemptCount: 1,
+        wakePolicy: prior.wakePolicy, maxAttempts: 5, resolvedAt: expect.any(Date),
+      });
+      const intervention = actions.find((action) => action.id !== prior.id)!;
+      expect(intervention).toMatchObject({
+        sourceIssueId, status: "active", ownerType: "board", ownerAgentId: null, ownerUserId: null,
+        previousOwnerAgentId: coderId, returnOwnerAgentId: coderId,
+        wakePolicy: { type: "board_escalation", reason: "stranded_assigned_issue", preservesSourceAssignee: true },
+        monitorPolicy: null, evidence: expect.objectContaining({ routingPolicy: "board_escalation_no_takeover_v1" }),
+      });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: coderId, assigneeUserId: null });
+      const comments = await db.select().from(issueComments);
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain("original assignee is not invokable");
+      expect(noticeMetadataReferencesRecoveryAction(comments[0]!.metadata, intervention.id)).toBe(true);
+      expect(await recoveryService(db, { enqueueWakeup }).reconcileLegacyContinuation(runId)).toBe("skipped");
+      expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ escalated: 0 });
+      expect(await db.select().from(issueRecoveryActions)).toEqual(actions);
+      expect(await db.select().from(issueComments)).toEqual(comments);
+      expect(await db.select().from(heartbeatRuns)).toEqual([expect.objectContaining({ id: runId, status: "succeeded" })]);
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["interaction", "approval", "dependency", "monitor", "budget", "active_run", "reassigned", "native", "review"])(
     "preserves the %s gate during unavailable-owner legacy reconciliation",
     async (gate) => {

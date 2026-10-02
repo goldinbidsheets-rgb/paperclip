@@ -2486,6 +2486,7 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    unavailableLegacyOwner?: boolean;
   }) {
     const recoveryCause = resolveStrandedRecoveryCause(
       input.latestRun,
@@ -2504,8 +2505,10 @@ export function recoveryService(
       // (for example the unresolved workspace base ref). A different ref is a
       // distinct blocker, so it must get a new recovery action and notify the
       // operator, not overwrite the active action of the prior ref.
-      supersedeOnIdentityChange: recoveryCause === "configuration_incomplete",
-      preserveExistingOwner: true,
+      // An unavailable legacy repair owner needs a new board intervention.
+      // Supersede the repair identity so its ownership and audit remain intact.
+      supersedeOnIdentityChange: recoveryCause === "configuration_incomplete" || input.unavailableLegacyOwner,
+      preserveExistingOwner: !input.unavailableLegacyOwner,
       kind: strandedRecoveryActionKind(recoveryCause),
       ownerType: isProviderQuotaWait ? "system" : "board",
       ownerAgentId: null,
@@ -3997,6 +4000,7 @@ export function recoveryService(
           issue: current,
           previousStatus: current.status as StrandedPreviousStatus,
           latestRun,
+          unavailableLegacyOwner: true,
           comment:
             "Paperclip cannot safely continue automatic recovery because the original assignee is not invokable. " +
             "The source assignment is unchanged and the board must choose the next action.",
@@ -4115,6 +4119,7 @@ export function recoveryService(
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    unavailableLegacyOwner?: boolean;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -4134,6 +4139,7 @@ export function recoveryService(
       latestRun: input.latestRun,
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+      unavailableLegacyOwner: input.unavailableLegacyOwner,
     });
     const isProviderQuotaWait =
       recoveryCause === "provider_quota" &&
