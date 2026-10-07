@@ -510,12 +510,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   it.each(["company", "issue", "legacy", "finished"])("rejects an apparently live run with the wrong %s authority", async (mismatch) => {
     const { companyId, sourceIssueId, runId, svc } = await seedNativeFinalizationRecovery("running");
     const other = await seedCompany();
-    await db.update(heartbeatRuns).set({
+    // Exercise service rejection of historical corruption behind the immutable binding trigger.
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`set local session_replication_role = replica`);
+      await tx.update(heartbeatRuns).set({
       ...(mismatch === "company" ? { companyId: other.companyId, agentId: other.coderId } : {}),
       ...(mismatch === "issue" ? { nativeIssueId: other.sourceIssueId } : {}),
       ...(mismatch === "legacy" ? { runtimeMode: "legacy" } : {}),
       ...(mismatch === "finished" ? { finishedAt: new Date() } : {}),
     }).where(eq(heartbeatRuns.id, runId));
+    });
     expect((await svc.getActiveForIssue(companyId, sourceIssueId))?.nativeRunActivity).toBeNull();
   });
 
