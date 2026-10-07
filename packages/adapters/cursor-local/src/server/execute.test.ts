@@ -351,7 +351,15 @@ printf '%s\\n' '{"type":"result","subtype":"success","session_id":"cursor-sessio
         const args = [...(input.args ?? [])];
         // This fake lease has no preinstalled CLI, regardless of the host PATH.
         if (args[1] === "command -v 'agent' >/dev/null 2>&1") {
-          return { exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "" };
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            stdout: "",
+            stderr: "",
+            pid: null,
+            startedAt: null,
+          };
         }
         if (args[1] === SANDBOX_INSTALL_COMMAND) {
           runnerState.installCommands.push(args[1]);
