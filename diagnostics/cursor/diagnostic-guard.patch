@@ -1,0 +1,32 @@
+--- a/packages/adapters/cursor-local/src/server/execute.test.ts
++++ b/packages/adapters/cursor-local/src/server/execute.test.ts
+@@ -80,6 +80,12 @@
+   ].join("\n");
+ }
+ 
++// Diagnostic-only containment; never part of the fixture-fix candidate.
++function diagnosticGuardPath(): string {
++  const directory = process.env.CURSOR_DIAGNOSTIC_GUARD_DIR;
++  if (!directory) throw new Error("CURSOR_DIAGNOSTIC_GUARD_DIR_REQUIRED");
++  return directory;
++}
+ function createFreshLeaseSandboxRunner(options: {
+   homeDir: string;
+   installCommandPath: string;
+@@ -119,7 +125,7 @@
+       const env = {
+         ...(input.env ?? {}),
+         HOME: input.env?.HOME ?? options.homeDir,
+-        PATH: pathWithLocalBin,
++        PATH: `${diagnosticGuardPath()}${path.delimiter}${pathWithLocalBin}`,
+       };
+ 
+       return await runChildProcess(`cursor-fresh-lease-${counter}`, input.command, args, {
+@@ -351,6 +357,6 @@
+           cwd: remoteWorkspace,
+-          env: { ...input.env, PATH: `${input.env?.PATH ?? ""}:/usr/bin:/bin` },
++          env: { ...input.env, PATH: `${diagnosticGuardPath()}${path.delimiter}${input.env?.PATH ?? ""}:/usr/bin:/bin` },
+           stdin: input.stdin,
+           timeoutSec: 30,
+           graceSec: 5,
+           onLog: async () => {},

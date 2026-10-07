@@ -1,0 +1,15 @@
+--- a/packages/adapters/cursor-local/src/server/execute.test.ts
++++ b/packages/adapters/cursor-local/src/server/execute.test.ts
+@@ -345,6 +345,12 @@
+     const runner = {
+       execute: async (input: { command: string; args?: string[]; env?: Record<string, string>; stdin?: string }) => {
+         runnerState.commands.push(input.command);
++        if (input.args?.[1] === "command -v 'agent' >/dev/null 2>&1") {
++          return { exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "" };
++        }
++        if (input.args?.[1] === SANDBOX_INSTALL_COMMAND) {
++          throw new Error("FIXTURE_EXTERNAL_INSTALL_REACHED");
++        }
+         // Exercise actual bounded file reads during managed-home restoration;
+         // reporting empty success for every shell command hides missing bytes.
+         return runChildProcess(`cursor-fresh-lease-${runnerState.commands.length}`, input.command, input.args ?? [], {
