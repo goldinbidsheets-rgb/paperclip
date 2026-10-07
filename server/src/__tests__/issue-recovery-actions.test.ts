@@ -12,6 +12,7 @@ import {
   agentRuntimeState,
   authUsers,
   budgetPolicies,
+  budgetIncidents,
   costEvents,
   agentWakeupRequests,
   activityLog,
@@ -157,6 +158,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   afterEach(async () => {
     await db.delete(costEvents);
+    await db.delete(budgetIncidents);
     await db.delete(budgetPolicies);
     await db.delete(workspaceOperations);
     await db.delete(issueThreadInteractions);
@@ -1206,6 +1208,51 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
     const [fresh] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"));
     expect(fresh).toMatchObject({ scheduledRetryAttempt: 1, resultJson: { conversationContinuation: "continue_conversation_v1" } });
+  });
+
+  it("holds the accounting lock before locking a quota issue", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, status: "failed",
+      errorCode: "provider_quota", finishedAt: new Date(),
+      resultJson: { conversationContinuation: "continue_conversation_v1", errorFamily: "provider_quota" },
+      contextSnapshot: { issueId: sourceIssueId } });
+    const transaction = db.transaction.bind(db);
+    const protectedIssueLocks: boolean[] = [];
+    const spy = vi.spyOn(db, "transaction").mockImplementation(((work: (tx: unknown) => unknown, config: unknown) =>
+      transaction(async (tx) => work(new Proxy(tx, {
+        get(target, property, receiver) {
+          if (property !== "execute") return Reflect.get(target, property, receiver);
+          return async (query: Parameters<typeof tx.execute>[0]) => {
+            const result = await target.execute(query);
+            // The quota producer's explicit issue lock is its only raw SELECT.
+            // A second connection must already be excluded from accounting.
+            if (query === undefined) return result;
+            const { PgDialect } = await import("drizzle-orm/pg-core");
+            const text = new PgDialect().sqlToQuery(query as ReturnType<typeof sql>).sql;
+            if (/select\s+"issues"\."id"[\s\S]*for update/i.test(text)) {
+              let protectedByCompanyLock = false;
+              try {
+                await transaction(async (other) => {
+                  await other.execute(sql`select id from companies where id = ${companyId} for no key update nowait`);
+                });
+              } catch (error) {
+                const code = (error as { cause?: { code?: string }; code?: string });
+                if ((code.cause?.code ?? code.code) !== "55P03") throw error;
+                protectedByCompanyLock = true;
+              }
+              protectedIssueLocks.push(protectedByCompanyLock);
+            }
+            return result;
+          };
+        },
+      })), config as never)) as typeof db.transaction);
+    try {
+      await recoveryService(db, { enqueueWakeup: vi.fn(async () => null) }).reconcileStrandedAssignedIssues();
+      expect(protectedIssueLocks).toEqual([true]);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "scheduled_retry"))).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it.each(["clear", "interaction", "exhausted"] as const)("reconciles a historical conversation quota wait with %s admission", async (admission) => {

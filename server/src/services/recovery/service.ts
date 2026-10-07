@@ -87,6 +87,7 @@ import {
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
+import { withAccountingTransaction } from "../accounting-transaction.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {
@@ -2628,7 +2629,9 @@ export function recoveryService(
   }) {
     const now = new Date();
     const requestedRetryAt = input.retryAt ?? readProviderQuotaRetryAt(input.latestRun, now);
-    return db.transaction(async (tx) => {
+    return withAccountingTransaction(db, input.issue.companyId, async (tx, accountingPublications) => {
+      // Admission mutates budget state. Match promotion's company -> issue
+      // order and publish its accounting events only after this retry commits.
       // Provider-quota waits are issue-scoped. Serialize their discovery and
       // creation so concurrent recovery sweeps cannot mint duplicate retries.
       // The lock is deliberately short-lived and does not alter issue state.
@@ -2700,7 +2703,7 @@ export function recoveryService(
       // policy removes the legacy action-outcome reconciliation hold.
       const exhausted = conversation && (retryAttempt > 2 || eligible.some((run) => (run.scheduledRetryAttempt ?? 0) > 2));
       const gate = conversation && !exhausted
-        ? await createRunDispatch(tx as unknown as Db).evaluateScheduledRetryGate({
+        ? await createRunDispatch(tx, { accountingPublications }).evaluateScheduledRetryGate({
             companyId: input.issue.companyId, runId: predecessor!.id,
             retryReasonOverride: "provider_quota_recovery", now,
           })

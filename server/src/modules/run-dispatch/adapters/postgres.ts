@@ -185,8 +185,11 @@ function statusEffect(run: HeartbeatRun, previousStatus: string | null): PostCom
 
 export function createPostgresRunDispatchAdapter(
   db: Db,
+  accountingPublications?: ActivityPublication[],
 ): ScheduledRetryReader & RunDispatchWriter {
-  const budgets = budgetService(db);
+  const budgets = accountingPublications
+    ? budgetServiceInTransaction(db, accountingPublications)
+    : budgetService(db);
   const treeControlSvc = issueTreeControlService(db);
   const issuesSvc = issueService(db);
 
