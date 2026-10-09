@@ -930,6 +930,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(second.outcome).toBe("scheduled");
     if (first.outcome !== "scheduled" || second.outcome !== "scheduled") return;
     expect(new Set([first.run.id, second.run.id]).size).toBe(1);
+    expect(second.reusedExisting).toBe(true);
+    expect(second.run).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1, startedAt: null });
+    expect(second.run.contextSnapshot).toEqual(first.run.contextSnapshot);
+    expect(await db.select().from(costEvents)).toHaveLength(0);
 
     const retryRuns = await db
       .select({ id: heartbeatRuns.id, wakeupRequestId: heartbeatRuns.wakeupRequestId })
@@ -1444,7 +1448,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
   });
 
-  it("coalesces duplicate max-turn continuation schedules for the same source run and attempt", async () => {
+  it.each(["concurrent", "ordered"] as const)("coalesces %s duplicate max-turn continuation schedules for the same source run and attempt", async (order) => {
     const { issueId, runId, now } = await seedMaxTurnFixture();
     const retryOptions = {
       now,
@@ -1454,10 +1458,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       delayMs: 1_000,
     };
 
-    const [first, second] = await Promise.all([
-      heartbeat.scheduleBoundedRetry(runId, retryOptions),
-      heartbeat.scheduleBoundedRetry(runId, retryOptions),
-    ]);
+    const [first, second] = order === "ordered"
+      ? [await heartbeat.scheduleBoundedRetry(runId, retryOptions),
+         await heartbeat.scheduleBoundedRetry(runId, retryOptions)]
+      : await Promise.all([
+          heartbeat.scheduleBoundedRetry(runId, retryOptions),
+          heartbeat.scheduleBoundedRetry(runId, retryOptions),
+        ]);
 
     expect(first.outcome).toBe("scheduled");
     expect(second.outcome).toBe("scheduled");
@@ -1501,6 +1508,69 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBe(retryRuns[0]?.id);
+  });
+
+  it.each([
+    "foreign-lock", "cleared-lock", "scope", "issue", "reason", "attempt", "predecessor", "agent", "company",
+    "reassigned", "pending-human", "disabled", "budget", "exhausted",
+  ] as const)("denies exact successor reuse after %s changes", async (change) => {
+    const f = await seedMaxTurnFixture();
+    await db.update(heartbeatRuns).set({ resultJson: {
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      conversationContinuation: "continue_conversation_v1",
+    } }).where(eq(heartbeatRuns.id, f.runId));
+    const options = { now: f.now, retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+      wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON, maxAttempts: 2, delayMs: 1_000 };
+    const first = await heartbeat.scheduleBoundedRetry(f.runId, options);
+    expect(first.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled") throw new Error("Expected initial successor");
+    const successorId = first.run.id;
+    const foreignId = randomUUID();
+    if (change === "foreign-lock") {
+      await db.insert(heartbeatRuns).values({ id: foreignId, companyId: f.companyId, agentId: f.agentId,
+        invocationSource: "automation", status: "queued", scopeKind: "issue", issueId: f.issueId });
+      await db.update(issues).set({ executionRunId: foreignId }).where(eq(issues.id, f.issueId));
+    } else if (change === "cleared-lock") {
+      await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+    } else if (change === "scope") {
+      await db.update(heartbeatRuns).set({ scopeKind: "company", issueId: null }).where(eq(heartbeatRuns.id, successorId));
+    } else if (change === "issue") {
+      await db.insert(issues).values({ id: foreignId, companyId: f.companyId, title: "Other issue", status: "in_progress" });
+      await db.update(heartbeatRuns).set({ issueId: foreignId }).where(eq(heartbeatRuns.id, successorId));
+    } else if (change === "reason") {
+      await db.update(heartbeatRuns).set({ scheduledRetryReason: "transient_failure" }).where(eq(heartbeatRuns.id, successorId));
+    } else if (change === "attempt") {
+      await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, successorId));
+    } else if (change === "predecessor") {
+      await db.update(heartbeatRuns).set({ retryOfRunId: null }).where(eq(heartbeatRuns.id, successorId));
+    } else if (change === "agent" || change === "company") {
+      const other = await seedMaxTurnFixture();
+      await db.update(heartbeatRuns).set(change === "agent" ? { agentId: other.agentId }
+        : { companyId: other.companyId }).where(eq(heartbeatRuns.id, successorId));
+    } else if (change === "reassigned") {
+      await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, f.issueId));
+    } else if (change === "pending-human") {
+      await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+        kind: "ask_user_questions", status: "pending", payload: { version: 1, questions: [] } });
+    } else if (change === "disabled") {
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: false } } }).where(eq(agents.id, f.agentId));
+    } else if (change === "budget") {
+      await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "company", scopeId: f.companyId,
+        windowKind: "calendar_month", amount: 0, hardStopEnabled: true });
+    }
+    const beforeRuns = await db.select().from(heartbeatRuns);
+    const beforeWakes = await db.select().from(agentWakeupRequests);
+    const beforeCosts = await db.select().from(costEvents);
+    const second = await heartbeat.scheduleBoundedRetry(f.runId, change === "exhausted" ? { ...options, maxAttempts: 0 } : options);
+    expect(second).toMatchObject({ outcome: change === "exhausted" ? "retry_exhausted" : "not_scheduled" });
+    const expectedError = change === "reassigned" ? "issue_reassigned"
+      : change === "pending-human" ? "issue_waiting_for_response"
+      : change === "disabled" ? "heartbeat_wake_on_demand_disabled"
+      : change === "budget" ? "budget_blocked" : "issue_execution_lock_changed";
+    if (change !== "exhausted") expect(second).toMatchObject({ errorCode: expectedError });
+    expect(await db.select().from(heartbeatRuns)).toEqual(beforeRuns);
+    expect(await db.select().from(agentWakeupRequests)).toEqual(beforeWakes);
+    expect(await db.select().from(costEvents)).toEqual(beforeCosts);
   });
 
   it.each(["schedule", "transaction", "promote", "dispatch"] as const)(
