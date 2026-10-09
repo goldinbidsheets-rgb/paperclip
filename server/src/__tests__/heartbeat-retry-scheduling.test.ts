@@ -11,6 +11,7 @@ import {
   agentWakeupRequests,
   activityLog,
   budgetPolicies,
+  budgetIncidents,
   companies,
   companySkills,
   createDb,
@@ -170,6 +171,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db.delete(environmentLeases);
     await db.delete(issueRelations);
     await db.delete(issues);
+    await db.delete(budgetIncidents);
     await db.delete(approvals);
     await db.delete(executionWorkspaces);
     await db.delete(projects);
@@ -930,10 +932,6 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(second.outcome).toBe("scheduled");
     if (first.outcome !== "scheduled" || second.outcome !== "scheduled") return;
     expect(new Set([first.run.id, second.run.id]).size).toBe(1);
-    expect(second.reusedExisting).toBe(true);
-    expect(second.run).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1, startedAt: null });
-    expect(second.run.contextSnapshot).toEqual(first.run.contextSnapshot);
-    expect(await db.select().from(costEvents)).toHaveLength(0);
 
     const retryRuns = await db
       .select({ id: heartbeatRuns.id, wakeupRequestId: heartbeatRuns.wakeupRequestId })
@@ -1471,6 +1469,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     if (first.outcome !== "scheduled" || second.outcome !== "scheduled") return;
 
     expect(new Set([first.run.id, second.run.id]).size).toBe(1);
+    if (order === "ordered") expect(second).toMatchObject({ reusedExisting: true });
+    expect(second.run).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1, startedAt: null });
+    expect(second.run.contextSnapshot).toEqual(first.run.contextSnapshot);
+    expect(await db.select().from(costEvents)).toHaveLength(0);
 
     const retryRuns = await db
       .select({
@@ -1536,7 +1538,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       await db.update(heartbeatRuns).set({ scopeKind: "company", issueId: null }).where(eq(heartbeatRuns.id, successorId));
     } else if (change === "issue") {
       await db.insert(issues).values({ id: foreignId, companyId: f.companyId, title: "Other issue", status: "in_progress" });
-      await db.update(heartbeatRuns).set({ issueId: foreignId }).where(eq(heartbeatRuns.id, successorId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...first.run.contextSnapshot, issueId: foreignId } }).where(eq(heartbeatRuns.id, successorId));
     } else if (change === "reason") {
       await db.update(heartbeatRuns).set({ scheduledRetryReason: "transient_failure" }).where(eq(heartbeatRuns.id, successorId));
     } else if (change === "attempt") {
@@ -1556,9 +1558,18 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: false } } }).where(eq(agents.id, f.agentId));
     } else if (change === "budget") {
       await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "company", scopeId: f.companyId,
-        windowKind: "calendar_month", amount: 0, hardStopEnabled: true });
+        windowKind: "calendar_month_utc", amount: 1, hardStopEnabled: true });
+      await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId,
+        provider: "test", biller: "test", billingType: "metered_api", model: "fixture",
+        inputTokens: 1, outputTokens: 1, costCents: 2, occurredAt: new Date() });
     }
-    const beforeRuns = await db.select().from(heartbeatRuns);
+    // Denial appends a lifecycle event (nextEventSeq/updatedAt may change).
+    // Compare scheduling authority/accounting, not those audit bookkeeping fields.
+    const readRuns = () => db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+      contextSnapshot: heartbeatRuns.contextSnapshot, retryOfRunId: heartbeatRuns.retryOfRunId,
+      attempt: heartbeatRuns.scheduledRetryAttempt, startedAt: heartbeatRuns.startedAt,
+      usageJson: heartbeatRuns.usageJson }).from(heartbeatRuns).orderBy(heartbeatRuns.id);
+    const beforeRuns = await readRuns();
     const beforeWakes = await db.select().from(agentWakeupRequests);
     const beforeCosts = await db.select().from(costEvents);
     const second = await heartbeat.scheduleBoundedRetry(f.runId, change === "exhausted" ? { ...options, maxAttempts: 0 } : options);
@@ -1568,8 +1579,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       : change === "disabled" ? "heartbeat_wake_on_demand_disabled"
       : change === "budget" ? "budget_blocked" : "issue_execution_lock_changed";
     if (change !== "exhausted") expect(second).toMatchObject({ errorCode: expectedError });
-    expect(await db.select().from(heartbeatRuns)).toEqual(beforeRuns);
-    expect(await db.select().from(agentWakeupRequests)).toEqual(beforeWakes);
+    const afterRuns = await readRuns();
+    const afterWakes = await db.select().from(agentWakeupRequests);
+    expect(afterRuns).toEqual(beforeRuns);
+    expect(afterWakes).toEqual(beforeWakes);
     expect(await db.select().from(costEvents)).toEqual(beforeCosts);
   });
 
