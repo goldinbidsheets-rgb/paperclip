@@ -1,0 +1,154 @@
+name: Accepted PR 12149 Linux verification
+on:
+  workflow_dispatch:
+    inputs:
+      launch_sha:
+        description: Exact reviewed workflow publication commit
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: pr-12149-accepted-linux
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.repository == 'goldinbidsheets-rgb/paperclip' && github.event.repository.fork == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Initialize failure evidence before checkout
+        id: initialize
+        shell: bash
+        env:
+          LAUNCH_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXPECTED_LAUNCH_SHA: ${{ inputs.launch_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pr12149-evidence"
+          printf 'launch=%s\nrun=%s\nattempt=%s\n' "$LAUNCH_SHA" "$RUN_ID" "$RUN_ATTEMPT" > "$RUNNER_TEMP/pr12149-evidence/launch.txt"
+          test "$LAUNCH_SHA" = "$EXPECTED_LAUNCH_SHA"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        id: checkout
+        with:
+          ref: ${{ github.sha }}
+          path: diagnostic
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        id: setup_node
+        with:
+          node-version: 24.13.1
+          package-manager-cache: false
+      - name: Materialize fixed source and run unchanged verifier
+        id: bootstrap_verifier
+        timeout-minutes: 32
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/pr12149-evidence"
+          package="$GITHUB_WORKSPACE/diagnostic/diagnostics/pr-12149-accepted"
+          source="$RUNNER_TEMP/pr12149-source"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export COREPACK_HOME="$RUNNER_TEMP/pr12149-corepack"
+          trap 'result=$?; printf "%s\n" "$result" > "$evidence/bootstrap-exit.txt"' EXIT
+          run() {
+            local label="$1"; shift
+            printf '%q ' "$@" > "$evidence/$label.command"
+            printf '\n' >> "$evidence/$label.command"
+            set +e
+            "$@" > "$evidence/$label.log" 2>&1
+            local result=$?
+            set -e
+            printf '%s\n' "$result" > "$evidence/$label.exit"
+            return "$result"
+          }
+          cd "$GITHUB_WORKSPACE/diagnostic"
+          run public-manifest sha256sum --check diagnostics/pr-12149-accepted/PUBLIC-MANIFEST.sha256
+          cd "$package"
+          run accepted-byte-check sha256sum --check <<'SHA256'
+          0c20282dbd9ffe02d746b69be9e3a77f105adcb5a1104b67d0fc8d7ad5e1a20d  candidate.bundle
+          53891fde575e391757800e2fac4d67585047630fd778e4dd0b3ca734f49127fb  source-identity.json
+          188b7ecb5c4584d150135e55e0cc038ec5bdda1e965d152f7af0960c70c69d7f  linux-verify.py
+          504c100d6aad8a2993135d5a20fcf5333d73f71831a0d73e39a0d71a3e6bffc7  LINUX-HANDBACK.md
+          SHA256
+          test ! -e "$source"
+          run git-init git -c core.autocrlf=false init "$source"
+          cd "$source"
+          run published-prerequisite timeout 240s git -c credential.helper= fetch --no-tags https://github.com/goldinbidsheets-rgb/paperclip.git 11259bdfb2d43045f39551ab9d0119b0931b422b
+          run upstream-prerequisite timeout 240s git -c credential.helper= fetch --no-tags https://github.com/paperclipai/paperclip.git 0b80ea17ef324385161c1430e87f8bb0707d8de9
+          run bundle-verify git bundle verify "$package/candidate.bundle"
+          run bundle-fetch git fetch "$package/candidate.bundle" HEAD:refs/heads/accepted-review
+          run candidate-checkout git -c core.autocrlf=false checkout --detach f2916ed16d4bc7b6b419a81ef79a5b5d02a54259
+          run source-identity python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          assert git('rev-parse', 'HEAD') == 'f2916ed16d4bc7b6b419a81ef79a5b5d02a54259'
+          assert git('rev-parse', 'HEAD^{tree}') == '8b9a6fc785acf1ac333d5270892b06522ad0df58'
+          assert not git('status', '--porcelain')
+          assert not pathlib.Path('node_modules').exists()
+          assert hashlib.sha256(pathlib.Path('pnpm-lock.yaml').read_bytes()).hexdigest() == 'e6cd2a8d9518b665bfb3fd1e1a8821a8113e6b264acb26c8fcedb6bad2b5cb61'
+          print(json.dumps({'candidate': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}')}))
+          PY
+          run node-version node --version
+          run corepack-version corepack --version
+          run prepare-pnpm timeout 120s corepack prepare pnpm@9.15.4 --activate
+          run compiler-version cc --version
+          run linker-version ld --version
+          run rustup-version rustup --version
+          run rust-toolchain-contract python3 - <<'PY'
+          import pathlib, tomllib
+          pin = tomllib.loads(pathlib.Path('packages/paperclip-runner/rust-toolchain.toml').read_text())['toolchain']
+          assert pin == {'channel': '1.97.1', 'profile': 'minimal', 'components': ['rustfmt']}, pin
+          print(pin)
+          PY
+          run rust-toolchain-install timeout 180s rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+          # The verifier drops RUSTUP_TOOLCHAIN and changes HOME. Pin the default
+          # in preserved RUSTUP_HOME as well as the repository's toolchain file.
+          run rust-default rustup default 1.97.1
+          run isolated-cache-preflight python3 - <<'PY'
+          import json, os, pathlib, subprocess, tempfile
+          with tempfile.TemporaryDirectory(prefix='pr12149-tool-probe-') as home:
+              env = {'PATH': os.environ['PATH'], 'HOME': home, 'TMPDIR': home,
+                     'PAPERCLIP_HOME': str(pathlib.Path(home) / 'paperclip'), 'NO_COLOR': '1', 'CI': 'true'}
+              for key in ('CARGO_HOME', 'RUSTUP_HOME', 'COREPACK_HOME', 'PNPM_HOME'):
+                  if key in os.environ:
+                      env[key] = os.environ[key]
+              for command, expected in [(['node', '--version'], 'v24.13.1'),
+                                        (['corepack', 'pnpm', '--version'], '9.15.4'),
+                                        (['rustc', '--version'], 'rustc 1.97.1 '),
+                                        (['cargo', '--version'], 'cargo 1.97.1 ')]:
+                  result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=90)
+                  print(json.dumps({'command': command, 'exitCode': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}), flush=True)
+                  assert result.returncode == 0
+                  assert result.stdout.strip() == expected or (expected.endswith(' ') and result.stdout.startswith(expected))
+          PY
+          # Total process budget only; no Vitest timeout/count override.
+          run accepted-verifier timeout --signal=TERM --kill-after=30s 1200s python3 "$package/linux-verify.py" "$source" "$evidence/verification"
+      - name: Retain action outcomes and all available evidence
+        id: finalize_evidence
+        if: always()
+        shell: bash
+        env:
+          STEP_OUTCOMES: ${{ toJSON(steps) }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr12149-evidence"
+          printf '%s\n' "$STEP_OUTCOMES" > "$RUNNER_TEMP/pr12149-evidence/action-outcomes.json"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'pr12149-evidence'
+          manifest = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in sorted(root.rglob('*')) if p.is_file() and p != root / 'MANIFEST.json'}
+          (root / 'MANIFEST.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        id: upload_evidence
+        if: always()
+        with:
+          name: pr12149-f2916ed1-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr12149-evidence/
+          if-no-files-found: error
+          retention-days: 7

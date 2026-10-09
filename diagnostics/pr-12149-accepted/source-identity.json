@@ -1,0 +1,16 @@
+{
+  "candidate": "f2916ed16d4bc7b6b419a81ef79a5b5d02a54259",
+  "tree": "8b9a6fc785acf1ac333d5270892b06522ad0df58",
+  "parents": [
+    "863cfa78d6a4f6ccbd1ee52cbae9fe66dc6ea0eb"
+  ],
+  "repairBase": "c88c9bd53eaf4ff58a89b295830bb4a790bf4518",
+  "baseTree": "f6579a40fba38776972f81d3affc7c315f8e36de",
+  "baseParents": [
+    "11259bdfb2d43045f39551ab9d0119b0931b422b",
+    "0b80ea17ef324385161c1430e87f8bb0707d8de9"
+  ],
+  "lockSha256": "e6cd2a8d9518b665bfb3fd1e1a8821a8113e6b264acb26c8fcedb6bad2b5cb61",
+  "node": "v24.13.1",
+  "pnpm": "9.15.4"
+}
