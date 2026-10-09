@@ -1,3 +1,5 @@
+import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../services/workspace-restore-recovery-state.js";
+import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, summarizeIssueMonitor } from "../services/issue-monitors.js";
 import type { IssuePrivacyConstraints } from "@paperclipai/shared";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
 import { activeIssueInteractionCondition, readTaskQuestionContext } from "../services/issue-question-context.js";
@@ -2167,106 +2169,6 @@ function summarizeIssueReferenceActivityDetails(
     ...(input.currentReferencedIssues.length > 0
       ? { currentReferencedIssues: input.currentReferencedIssues }
       : {}),
-  };
-}
-
-function monitorPoliciesEqual(
-  left: NormalizedExecutionPolicy | null,
-  right: NormalizedExecutionPolicy | null,
-) {
-  return (
-    JSON.stringify(left?.monitor ?? null) ===
-    JSON.stringify(right?.monitor ?? null)
-  );
-}
-
-function applyActorMonitorScheduledBy(
-  policy: NormalizedExecutionPolicy | null,
-  actorType: "agent" | "user",
-) {
-  return setIssueExecutionPolicyMonitorScheduledBy(
-    policy,
-    actorType === "user" ? "board" : "assignee",
-  );
-}
-
-async function assertCanManageIssueMonitor(
-  accessSvc: ReturnType<typeof accessService>,
-  req: Request,
-  companyId: string,
-  assigneeAgentId: string | null,
-  monitorChanged: boolean,
-) {
-  if (!monitorChanged) return;
-  if (req.actor.type === "board") return;
-  const runtimeDecision = await accessSvc.decide({
-    actor: req.actor,
-    action: "runtime:manage",
-    resource: { type: "company", companyId },
-  });
-  if (!runtimeDecision.allowed) {
-    throw forbidden(
-      runtimeDecision.explanation,
-      authorizationDeniedDetails(runtimeDecision),
-    );
-  }
-  if (
-    req.actor.type === "agent" &&
-    req.actor.agentId &&
-    req.actor.agentId === assigneeAgentId
-  )
-    return;
-  throw forbidden(
-    "Only the assignee agent or a board user can manage issue monitors",
-  );
-}
-
-function summarizeIssueMonitor(
-  issue: {
-    monitorNextCheckAt?: Date | null;
-    monitorLastTriggeredAt?: Date | null;
-    monitorAttemptCount?: number | null;
-    monitorNotes?: string | null;
-    monitorScheduledBy?: string | null;
-    executionState?: unknown;
-  },
-  policy: NormalizedExecutionPolicy | null,
-) {
-  const state = parseIssueExecutionState(issue.executionState);
-  return {
-    nextCheckAt:
-      issue.monitorNextCheckAt?.toISOString() ??
-      policy?.monitor?.nextCheckAt ??
-      null,
-    lastTriggeredAt:
-      issue.monitorLastTriggeredAt?.toISOString() ??
-      state?.monitor?.lastTriggeredAt ??
-      null,
-    attemptCount:
-      issue.monitorAttemptCount ?? state?.monitor?.attemptCount ?? 0,
-    notes:
-      policy?.monitor?.notes ??
-      issue.monitorNotes ??
-      state?.monitor?.notes ??
-      null,
-    scheduledBy:
-      issue.monitorScheduledBy ??
-      policy?.monitor?.scheduledBy ??
-      state?.monitor?.scheduledBy ??
-      null,
-    kind: policy?.monitor?.kind ?? state?.monitor?.kind ?? null,
-    serviceName:
-      policy?.monitor?.serviceName ?? state?.monitor?.serviceName ?? null,
-    externalRef: redactIssueMonitorExternalRef(
-      policy?.monitor?.externalRef ?? state?.monitor?.externalRef ?? null,
-    ),
-    timeoutAt: policy?.monitor?.timeoutAt ?? state?.monitor?.timeoutAt ?? null,
-    maxAttempts:
-      policy?.monitor?.maxAttempts ?? state?.monitor?.maxAttempts ?? null,
-    recoveryPolicy:
-      policy?.monitor?.recoveryPolicy ?? state?.monitor?.recoveryPolicy ?? null,
-    status: state?.monitor?.status ?? (policy?.monitor ? "scheduled" : null),
-    clearReason: state?.monitor?.clearReason ?? null,
   };
 }
 
@@ -9468,9 +9370,15 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    const retainedHolds = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+      sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+    )).orderBy(desc(issueRecoveryActions.createdAt));
     res.json({
       active,
-      actions: active ? [active] : [],
+      actions: [...(active ? [active] : []), ...retainedHolds
+        .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)],
     });
   });
 
@@ -9563,6 +9471,37 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+
+        // Retained files are a source-scoped obligation, independent of the
+        // current task owner/generation and any newer active recovery incident.
+        // Repair records evidence only: it must not reopen or replay old work.
+        const [workspaceRepairAction] = await tx.select().from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, lockedIssue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
+          actionId ? eq(issueRecoveryActions.id, actionId) : inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        )).limit(1).for("update");
+        if (workspaceRepairAction && hasRequiredWorkspaceRecovery(workspaceRepairAction.evidence)) {
+          assertBoard(req);
+          await requireRecoveryActionAuthority(req, lockedIssue, issueRecoveryActionReadModel(workspaceRepairAction),
+            { source: "recovery_action_resolution" });
+          if (outcome !== "restored" || sourceIssueStatus !== lockedIssue.status) {
+            throw conflict("Record workspace repair without changing the current task status or requesting a retry.");
+          }
+          await validateExecutionReconciliation({ db: tx as unknown as Db,
+            companyId: lockedIssue.companyId, issueId: lockedIssue.id, agentId: lockedIssue.assigneeAgentId,
+            sourceRunId: workspaceRepairAction.evidence.runId, decision: executionReconciliation,
+            workspaceRepairOnly: true,
+          });
+          if (workspaceRepairAction.evidence.executionReconciliation) {
+            return { issue: lockedIssue, recoveryAction: workspaceRepairAction, replayed: true, workspaceRepairOnly: true };
+          }
+          await markExecutionReconciliation(tx as unknown as Db, workspaceRepairAction,
+            executionReconciliation!, actor.actorId, undefined, { workspaceRepairOnly: true });
+          const [recoveryAction] = await tx.update(issueRecoveryActions).set({ status: "resolved", outcome: "restored",
+            resolutionNote: resolutionNote ?? null, resolvedAt: new Date(), updatedAt: new Date(),
+          }).where(eq(issueRecoveryActions.id, workspaceRepairAction.id)).returning();
+          return { issue: lockedIssue, recoveryAction, chatRetry: null, workspaceRepairOnly: true };
+        }
 
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
@@ -9944,7 +9883,9 @@ export function issueRoutes(
       });
       if (result.replayed) {
         res.json({
-          issue: result.issue,
+          issue: "workspaceRepairOnly" in result
+            ? { ...result.issue, activeRecoveryAction: await recoveryActionsSvc.getActiveForIssue(result.issue.companyId, result.issue.id) }
+            : result.issue,
           recoveryAction: result.recoveryAction,
         });
         return;
@@ -10053,7 +9994,9 @@ export function issueRoutes(
       res.json({
         issue: {
           ...result.issue,
-          activeRecoveryAction: null,
+          activeRecoveryAction: "workspaceRepairOnly" in result
+            ? await recoveryActionsSvc.getActiveForIssue(result.issue.companyId, result.issue.id)
+            : null,
         },
         recoveryAction: result.recoveryAction,
       });
